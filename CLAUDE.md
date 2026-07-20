@@ -7,6 +7,161 @@ Create a new ExileAPI plugin, tentatively named `FaustusController`, with two re
 1. Safely generate mouse and keyboard input while Path of Exile is the foreground window.
 2. Read and persist Currency Exchange data associated with the Faustus exchange UI.
 
+The optimization target is to accumulate Chaos Orbs or Divine Orbs through whole-unit conversions while minimizing transaction costs. Use `1 Divine Orb = 200 Chaos Orbs` as the configurable valuation baseline, not as a replacement for observed market quotes.
+
+## Current Increment: Read-Only Rate Collection
+
+The first implementation increment deliberately stops before picker automation and path optimization. It can capture the currently selected offered/wanted pair when the user presses F6 and stores the latest snapshot for that directed pair in memory.
+
+Current source layout:
+
+| File | Responsibility |
+| --- | --- |
+| `ExchangeRates.cs` | API-independent currency identities, directed pair keys, exact rational rates, whole-unit conversion, snapshots, and latest-rate storage |
+| `CurrencyExchangeRateCollector.cs` | Adapter from `CurrencyExchangePanel` public properties into domain snapshots |
+| `RateCaptureJsonExporter.cs` | Versioned, atomic JSON export of raw and normalized snapshots |
+| `FaustusController.cs` | ExileAPI lifecycle, capture hotkey handling, and minimal status rendering |
+| `FaustusControllerSettings.cs` | Small user-configurable settings only |
+
+Do not add optimization rules to the collector or UI automation to the rate book. The collector translates live state, the rate book stores observations, and future optimization consumes immutable snapshots.
+
+### Exact Rate Representation
+
+Never store an exchange rate only as `float` or `double`. Preserve the panel's integer `Get` and `Give` values and reduce them with their greatest common divisor:
+
+```text
+wanted units received / offered units spent = Get / Give
+```
+
+Examples:
+
+| Display value | Exact executable ratio |
+| --- | --- |
+| `0.5 chaos` | `1 chaos / 2 source units` |
+| `15 chaos` | `15 chaos / 1 source unit` |
+| `0.6 divines` | `3 divines / 5 source units` |
+
+`decimal WantedPerOffered` is a derived display/scoring value only. Execution uses the reduced integer ratio. For `available` offered units:
+
+```text
+batches = floor(available / GiveUnits)
+spent = batches * GiveUnits
+received = batches * GetUnits
+remainder = available - spent
+```
+
+This prevents fractional currency output. Future path comparison should use cross multiplication or another exact rational comparison where rounding could change the winning route.
+
+### Directed Pair Semantics
+
+Every rate is directional:
+
+```text
+OfferedCurrency -> WantedCurrency
+```
+
+The pair key uses both currencies' `BaseItemType.Metadata`. The reverse direction is a separate observation and must never be inferred by taking the reciprocal because spreads, stock, and transaction costs can differ.
+
+`MarketRateGet` and `MarketRateGive` are selected-pair values: wanted units received and offered units given. Stock rows require side-aware interpretation.
+
+For selected pair `OfferedCurrency -> WantedCurrency`:
+
+| Source | Meaning | Selected-pair rate |
+| --- | --- | --- |
+| `MarketRateGet/MarketRateGive` | Current market/immediate ratio for the selected direction | `Get / Give` |
+| `WantedItemStock` | Existing listings stocked with the currency the user wants; immediately fillable from the selected direction | `RawGet / RawGive` |
+| `OfferedItemStock` | Competing inverse listings stocked with the currency the user has | `RawGive / RawGet` for selected-direction comparison only |
+
+Observed example on 2026-07-20:
+
+```text
+I want Chaos, I have Divine
+Market/immediate ratio:         840 Chaos : 1 Divine
+Top wanted-stock row:           raw 840 Chaos : 1 Divine
+Top inverse/competing listing: raw 1 Divine : 815 Chaos
+Selected-direction comparison: 815 Chaos : 1 Divine
+
+After swapping the panel:
+I want Divine, I have Chaos
+Market ratio:                   1 Divine : 815 Chaos
+```
+
+The 31-pair JSON audit on 2026-07-20 confirmed that `MarketRate` equals the first raw `WantedItemStock` row for every capture. `OfferedItemStock` is the inverse competing book. This spread is meaningful: do not replace the immediate `840:1` quote with the competing `815:1` equivalent, and do not treat the competing equivalent as executable in the selected direction. Swapping the panel turns that inverse listing into the new selected market.
+
+### Baseline Valuation
+
+Keep valuation policy separate from exchange quotes:
+
+```text
+Chaos Orb  = 1 chaos-value unit
+Divine Orb = 200 chaos-value units
+```
+
+The baseline is for comparing route outcomes in a common unit. It must not overwrite a captured Chaos/Divine market edge. Make the value configurable when optimization is introduced so league-specific assumptions can change without changing collected data.
+
+### Optimizer Data Contracts
+
+Introduce optimizer types only after snapshot collection is stable. Keep them API-independent and use integer quantities throughout route execution:
+
+```csharp
+public sealed record CurrencyBalance(string Metadata, long Units);
+
+public sealed record TransactionCost(
+    long Gold,
+    long SourceCurrencyUnits);
+
+public sealed record ConversionStepResult(
+    CurrencyPairKey Pair,
+    long InputUnits,
+    long SpentUnits,
+    long OutputUnits,
+    long RemainderUnits,
+    long GoldCost);
+
+public sealed record ConversionRouteResult(
+    IReadOnlyList<ConversionStepResult> Steps,
+    long FinalTargetUnits,
+    long TotalGoldCost);
+```
+
+Do not combine gold and currency into one scalar unless an explicit gold valuation is introduced. Prefer a constrained/lexicographic objective:
+
+1. Reject routes exceeding balances, stock, freshness, hop, or gold-budget constraints.
+2. Maximize whole Chaos or Divine units at the target.
+3. For equal output, minimize gold cost.
+4. For equal output and gold, minimize hops and stranded remainders.
+
+An optimizer edge should reference the immutable snapshot it came from so route results can report quote age and be invalidated before execution. The optimizer should never read `CurrencyExchangePanel` directly.
+
+### Collection Freshness and History
+
+The current `ExchangeRateBook` stores only the latest snapshot per pair in its private `_latestByPair` dictionary. That dictionary exists only in the active plugin process. It is retained across area changes but lost on plugin reload or process exit.
+
+After every successful capture, export the rate book to:
+
+```text
+<ConfigDirectory>/FaustusController_rate-captures.json
+```
+
+For this distribution, `ConfigDirectory` resolves to `config/FaustusController`. Schema v1 uses the corrected stock-side direction mapping and includes both currency identities, capture timestamps, market rates, top immediate and competing rates, every raw stock row, selected-pair rates, and listing counts. Export through a temporary file followed by an atomic replacement. Merge with an existing schema-compatible export by directed pair so plugin reloads do not erase previously exported pairs. This is pre-release development, so do not add migration or backward-compatibility code; discard invalid development captures when the schema changes.
+
+A future history increment should add league, scan identifier, and optional failure/staleness reason. Apply a configurable maximum quote age before building graph edges; never silently mix fresh and stale observations from different scans.
+
+Keep each stock row's raw ratio as well as its normalized selected-pair comparison ratio. Do not treat `ListedCount` as available currency volume without validation; its public name supports listing count, not necessarily fillable units.
+
+### Planned Expansion Boundaries
+
+1. Persist versioned snapshots separately from the static currency catalogue.
+2. Add a bounded history per directed pair and freshness/league metadata.
+3. Add a cancelable scanner state machine that opens one picker, selects by `ItemType.Metadata`, waits for panel state to stabilize, captures, then advances.
+4. Start scanning only `currency -> Chaos` and `currency -> Divine` pairs before attempting the full directed graph.
+5. Build a graph where currencies are vertices and fresh executable quotes are directed edges.
+6. Add balances, stock/liquidity limits, gold costs, and whole-unit remainders to route simulation.
+7. Add bounded path search with cycle prevention and configurable maximum hops.
+8. Add dry-run route display before any order placement automation.
+
+The future scanner should use explicit states such as `Idle`, `OpenPicker`, `SelectCurrency`, `WaitForSelection`, `WaitForRate`, `Capture`, `Advance`, `Completed`, and `Faulted`. It must reacquire panel/option elements on every state transition and obey the input safety rules below.
+
 This folder is a compiled ExileAPI distribution, not a source checkout. The public API was determined from the supplied plugin template, dependency manifests, loaded plugins, and public metadata/decompilation of `ExileCore.dll`.
 
 ## Important Findings

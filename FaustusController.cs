@@ -4,56 +4,97 @@ using Vector2 = System.Numerics.Vector2;
 
 namespace FaustusController;
 
-public class FaustusController : BaseSettingsPlugin<FaustusControllerSettings>
+public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSettings>
 {
+    private readonly CurrencyExchangeRateCollector _collector = new();
+    private readonly ExchangeRateBook _rateBook = new();
+    private readonly RateCaptureJsonExporter _exporter = new();
+    private string _captureStatus = "Use the capture hotkey with an exchange pair selected.";
+    private string _exportPath = "";
+    private string _exportStatus = "";
+
     public override bool Initialise()
     {
-        //Perform one-time initialization here
-
-        //Maybe load you custom config (only do so if builtin settings are inadequate for the job)
-        //var configPath = Path.Join(ConfigDirectory, "custom_config.txt");
-        //if (File.Exists(configPath))
-        //{
-        //    var data = File.ReadAllText(configPath);
-        //}
+        _exportPath = Path.Combine(ConfigDirectory, "FaustusController_rate-captures.json");
+        if (File.Exists(_exportPath))
+        {
+            try
+            {
+                var exportedCount = _exporter.Export([], _exportPath);
+                _exportStatus = $"Validated {exportedCount} exported pairs at {_exportPath}";
+            }
+            catch (Exception exception)
+            {
+                _exportStatus = $"Rate export validation failed: {exception.Message}";
+            }
+        }
+        else
+        {
+            _exportStatus = $"Capture export: {_exportPath}";
+        }
 
         return true;
     }
 
     public override void AreaChange(AreaInstance area)
     {
-        //Perform once-per-zone processing here
-        //For example, Radar builds the zone map texture here
+        _captureStatus = "Area changed; captured rate snapshots were retained.";
     }
 
     public override Job Tick()
     {
-        //Perform non-render-related work here, e.g. position calculation.
-        //This method is still called on every frame, so to really gain
-        //an advantage over just throwing everything in the Render method
-        //you have to return a custom job, but this is a bit of an advanced technique
-        //here's how, just in case:
-        //return new Job($"{nameof(FaustusController)}MainJob", () =>
-        //{
-        //    var a = Math.Sqrt(7);
-        //});
+        if (Settings.CaptureCurrentRate.PressedOnce())
+        {
+            if (_collector.TryCaptureCurrentPair(GameController, out var snapshot, out var failureReason))
+            {
+                _rateBook.Store(snapshot!);
+                var immediateStock = snapshot!.TopImmediateStock;
+                var rawImmediate = immediateStock == null
+                    ? ""
+                    : $" (raw wanted {immediateStock.RawGet}:{immediateStock.RawGive})";
+                var competingStock = snapshot.TopCompetingStock;
+                var rawCompeting = competingStock == null
+                    ? ""
+                    : $" (raw opposite {competingStock.RawGet}:{competingStock.RawGive})";
+                _captureStatus = $"Captured {snapshot!.OfferedCurrency.Name} -> " +
+                    $"{snapshot.WantedCurrency.Name}. Market: {FormatRatio(snapshot.MarketRate)}; " +
+                    $"immediate: {FormatRatio(snapshot.TopImmediateRate)}{rawImmediate}; " +
+                    $"competing: {FormatRatio(snapshot.TopCompetingRate)}{rawCompeting}.";
 
-        //otherwise, just run your code here
-        //var a = Math.Sqrt(7);
+                try
+                {
+                    var exportedCount = _exporter.Export(
+                        _rateBook.LatestSnapshots,
+                        _exportPath);
+                    _exportStatus = $"Exported {exportedCount} pairs to {_exportPath}";
+                }
+                catch (Exception exception)
+                {
+                    _exportStatus = $"Rate export failed: {exception.Message}";
+                }
+            }
+            else
+            {
+                _captureStatus = failureReason;
+            }
+        }
+
         return null!;
+    }
+
+    private static string FormatRatio(RationalExchangeRate? rate)
+    {
+        return rate == null ? "unavailable" : $"{rate.GetUnits}:{rate.GiveUnits}";
     }
 
     public override void Render()
     {
-        //Any Imgui or Graphics calls go here. This is called after Tick
-        Graphics.DrawText($"Plugin {GetType().Name} is working.", new Vector2(100, 100), SharpDX.Color.Red);
+        Graphics.DrawText(_captureStatus, new Vector2(100, 100), SharpDX.Color.White);
+        Graphics.DrawText(
+            $"Captured pairs: {_rateBook.LatestSnapshots.Count}",
+            new Vector2(100, 120),
+            SharpDX.Color.White);
+        Graphics.DrawText(_exportStatus, new Vector2(100, 140), SharpDX.Color.White);
     }
 
-    public override void EntityAdded(Entity entity)
-    {
-        //If you have a reason to process every entity only once,
-        //this is a good place to do so.
-        //You may want to use a queue and run the actual
-        //processing (if any) inside the Tick method.
-    }
 }
