@@ -9,9 +9,9 @@ Create a new ExileAPI plugin, tentatively named `FaustusController`, with two re
 
 The optimization target is to accumulate Chaos Orbs or Divine Orbs through whole-unit conversions while minimizing transaction costs. Use `1 Divine Orb = 200 Chaos Orbs` as the configurable valuation baseline, not as a replacement for observed market quotes.
 
-## Current Increment: Read-Only Rate Collection
+## Current Increment: Bounded Multi-Pair Capture
 
-The first implementation increment deliberately stops before picker automation and path optimization. It can capture the currently selected offered/wanted pair when the user presses F6 and stores the latest snapshot for that directed pair in memory.
+F3 runs a bounded batch of 1-10 unique directed pairs from the initial `currency -> Chaos` and `currency -> Divine` collection scope. Every pair delegates to the verified F4 one-pair workflow, must produce a fresh stable-rate snapshot, and must persist that snapshot before the batch advances. Pressing F3 again cancels the batch. The implementation deliberately stops before full-plan scanning and path optimization. F4 still runs exactly one current F7 preview pair, and F5-F12 retain the individually testable lower-level operations.
 
 Current source layout:
 
@@ -19,11 +19,354 @@ Current source layout:
 | --- | --- |
 | `ExchangeRates.cs` | API-independent currency identities, directed pair keys, exact rational rates, whole-unit conversion, snapshots, and latest-rate storage |
 | `CurrencyExchangeRateCollector.cs` | Adapter from `CurrencyExchangePanel` public properties into domain snapshots |
+| `CurrencyCatalogue.cs` | Deterministic catalogue keyed by `BaseItemType.Metadata`, built from the Currency Exchange DAT wrapper |
+| `CurrencyScanPlan.cs` | De-duplicated plan for all directed pairs where Chaos or Divine is one endpoint |
+| `CurrencyPickerInspector.cs` | Read-only visible picker-option identity, owned amount, and center-coordinate inspection |
+| `CurrencySearchQueryController.cs` | Foreground-gated Ctrl+F, Ctrl+A, token entry, timeout, cancellation, and exact metadata verification |
+| `CursorTweenController.cs` | Non-blocking curved cursor interpolation with continuous target/context validation and manual interruption detection |
+| `VerifiedOptionSelectionController.cs` | One guarded left click followed by passive selected-item verification with no retry |
+| `PickerButtonCalibration.cs` | Manual picker-open transition capture, panel-relative calibration, atomic JSON persistence, and target resolution |
+| `CalibratedPickerOpenController.cs` | Curved movement to one calibrated picker button, one click, and expected-side verification without retry |
+| `SinglePairScanController.cs` | One-pair orchestration across verified controllers, stable-rate sampling, capture, and hard stop |
+| `BoundedScanController.cs` | Bounded initial-scope iteration, per-run freshness/uniqueness guards, persistence handshake, and explicit cancellation |
 | `RateCaptureJsonExporter.cs` | Versioned, atomic JSON export of raw and normalized snapshots |
 | `FaustusController.cs` | ExileAPI lifecycle, capture hotkey handling, and minimal status rendering |
 | `FaustusControllerSettings.cs` | Small user-configurable settings only |
 
 Do not add optimization rules to the collector or UI automation to the rate book. The collector translates live state, the rate book stores observations, and future optimization consumes immutable snapshots.
+
+### Dry-Run Scan Preview
+
+For `N` catalogue currencies, the plan contains `4N - 6` unique directed pairs:
+
+```text
+currency -> Chaos
+currency -> Divine
+Chaos -> currency
+Divine -> currency
+```
+
+Self-pairs and duplicate Chaos/Divine cross-pairs are removed. Currency order is deterministic by base name then metadata, except that the initial collection scope deliberately places `Orb of Alteration -> Chaos Orb` first as a liquid runtime-test pair. The initial scope contains the `2N - 2` unique pairs whose wanted endpoint is Chaos or Divine. F7 resets the preview to that first Alteration/Chaos pair; successful F3 captures advance the preview through the remaining scope. The reverse `Chaos/Divine -> currency` families remain in the full plan but are not yet automated by F3.
+
+When a picker is open, inspect `CurrencyPicker.Options`, resolve each visible option by `ItemType.Metadata`, and derive its center from `GetClientRectCache`. Retain only immutable identity and coordinate values; never retain the `Element`. Re-inspect every tick while previewing so scrolling and layout changes update the target. The yellow `DRY RUN TARGET` label is visualization only and must not generate input.
+
+The original alphabetical first step, `A Chilling Wind -> Chaos Orb`, frequently had no positive market rate. The runtime-test start was changed to `Orb of Alteration -> Chaos Orb` so stable-rate capture and multi-pair advancement can be exercised with a liquid pair. The preview still clears on area change.
+
+### Search-First Picker Strategy
+
+Using the picker search field is preferred over scrolling because it avoids scroll-position assumptions and should reduce each picker to a small result set. The public `CurrencyExchangeCurrencyPickerElement` has no dedicated search-field property. Available public surfaces are the generic `Element.Children`, `Element.Parent`, `TextNoTags`, visibility, and `GetClientRectCache`.
+
+Runtime testing inspected 513 picker descendants without finding the search field. Neither text nor geometry discovery is reliable through the public element tree and both approaches were removed.
+
+Path of Exile provides a better supported interaction: Ctrl+F automatically focuses the open picker search box. Use that shortcut instead of locating or clicking the field. Runtime testing confirmed that guarded F8 focuses the expected search field, manual queries filter correctly for both picker sides, and modifiers are released.
+
+F8 is the focus-only test hotkey and is guarded by all of the following:
+
+1. `AllowSearchFocusInput` is disabled by default and must be explicitly enabled.
+2. A scan preview must already exist from F7.
+3. Path of Exile must be the foreground window.
+4. The Currency Exchange panel and currency picker must both be visible.
+5. Foreground and UI visibility are revalidated after Ctrl is pressed and before F is pressed.
+6. F and Ctrl key-up are attempted unconditionally, including failure and cancellation paths.
+
+F8 sends only Ctrl+F. It does not type the query or select an option. The user manually types the cyan status-line query to verify that focus landed in the correct control.
+
+F9 is the query-entry test and has a separate `AllowSearchQueryInput` toggle that defaults to disabled. It executes at most one input action per `Tick` and never sleeps:
+
+```text
+WaitForTriggerRelease  wait until the configured F9 hotkey is up, then settle 75 ms
+FocusSearch            Ctrl+F
+SelectExistingQuery    Ctrl+A
+EnterQuery             one lowercase key every 30 ms
+WaitForFilteredOption  poll every 50 ms, maximum 3 seconds
+Completed              exact ItemType.Metadata is visible
+Faulted                foreground, panel, picker side, input, or timeout failure
+```
+
+To avoid keyboard-layout-sensitive punctuation, derive the query from the longest lowercase alphanumeric token in the currency name. Examples: `Chaos Orb -> chaos`, `A Chilling Wind -> chilling`, and `Engineer's Orb -> engineer`. A partial query is acceptable only because completion requires an exact metadata match. F9 never clicks the result. Disable `AllowSearchQueryInput`, change areas, close/swap the picker, lose foreground, hold a modifier, or exceed the operation timeout to cancel without further characters. F8 is blocked while automatic query entry is active.
+
+Runtime testing found that the picker search box is focused as soon as the picker opens and remains focused after a query. `HotkeyNodeV2` normally suppresses plugin hotkeys while a text input is focused, which made the first or repeated F9 press appear ineffective until clicking the picker removed text focus. Set `IgnoreFocusedInput = true` on both F8 and F9, enforce it again during plugin initialization for existing settings, and wait for the physical activation key to be released before generating Ctrl+F. No focus-establishing mouse click is required.
+
+Runtime verification confirmed that this focused-input correction allows both the first and repeated F9 query to succeed without clicking the picker.
+
+### Verified Mouse Movement
+
+Runtime testing confirmed that the F10 option center maps to the correct on-screen currency, leaves the picker open, and does not click. Replace teleportation with a non-blocking tween while preserving the same guards.
+
+F10 is a tween-only coordinate test. `AllowVerifiedTargetMouseMove` defaults to disabled. Before moving, require all of the following:
+
+1. F9 completed with an exact metadata match.
+2. Path of Exile is foreground.
+3. The Currency Exchange panel and picker remain visible.
+4. The wanted/offered picker side is unchanged from query verification.
+5. The option list is re-read and contains the same exact metadata.
+6. The fresh option center lies inside the current picker rectangle.
+7. Foreground, panel, picker, and side are revalidated immediately before movement.
+
+Use a cubic Bézier path with smoothstep timing. Duration is distance divided by `CursorTweenSpeed` (default 1600 pixels/second), clamped to 120-650 ms. Offset both control points perpendicular to the direct path by a distance-scaled amount and alternate curve direction between movements. Do not add random jitter.
+
+During every tween tick:
+
+1. Revalidate foreground, panel, picker, picker side, exact metadata, visibility, and picker bounds.
+2. Cancel if the fresh target center moved more than 4 pixels from the verified endpoint.
+3. Cancel if the actual cursor differs by more than 25 pixels from the last commanded position, treating that as manual user interruption.
+4. Calculate one eased Bézier position and call `Input.SetCursorPos` once.
+5. Never retain an `Element` or send a mouse button event.
+
+F10 has `IgnoreFocusedInput = true` because the picker search remains focused. Starting a new preview/query, disabling mouse movement, changing areas, or losing context cancels an active tween.
+
+Runtime testing confirmed that the Bézier/smoothstep F10 movement follows the expected curved path, reaches the verified option, respects speed settings, cancels correctly, and does not click.
+
+### Single Verified Option Click
+
+F11 is the first click-enabled increment. `AllowVerifiedOptionClick` defaults to disabled. F11 has `IgnoreFocusedInput = true` and may send exactly one left-button down/up pair only when:
+
+1. F9 completed with an exact metadata target.
+2. F10 completed for the same metadata and picker side.
+3. Path of Exile is foreground and the panel/picker are visible.
+4. The current picker side still matches the query and tween.
+5. A fresh picker inspection contains the exact metadata.
+6. The fresh center remains within 4 pixels of the completed tween endpoint.
+7. The current cursor lies inside the fresh option bounds with a 2-pixel inset.
+8. Foreground and picker state are revalidated immediately before mouse down.
+
+Set the mouse-down flag before calling `Input.LeftDown`, and attempt `Input.LeftUp` unconditionally in `finally`. Never hold the button across ticks. After the click, wait up to two seconds for the picker to close and for `WantedItemType` or `OfferedItemType`, according to picker side, to equal the target metadata. Report completion only after both conditions hold. Never retry a timed-out click automatically.
+
+The current and future input state machine uses:
+
+```text
+OpenPicker
+SendCtrlF
+ClearSearch
+EnterQuery
+WaitForFilteredOptions
+VerifyExactMetadata
+SelectOption
+WaitForSelection
+```
+
+Never click the first search result blindly. Re-read `CurrencyPicker.Options` and require an exact `ItemType.Metadata` match before selection.
+
+### Runtime Test Procedure
+
+1. Run `dotnet build Plugins/Source/FaustusController/FaustusController.csproj` with `exapiPackage` set to the ExileAPI distribution root.
+2. Reload the source plugin, enable it, and open the Currency Exchange panel with both currencies selected.
+3. Press F7 with the picker closed. Confirm the yellow status reports catalogue count, plan step count, the next directed pair, and a prompt to open a picker.
+4. Open the `I want` picker. Confirm the yellow status reports that the planned Ctrl+F query is `Chaos Orb`.
+5. Leave `AllowSearchQueryInput` disabled and press F9. Confirm the query status says input was blocked and no text changes.
+6. Enable `AllowSearchQueryInput`, open the picker, do not click anywhere inside it, and press F9 once.
+7. Confirm the search field is replaced with `chaos`, the picker filters, the yellow target marks Chaos Orb, and query status ends with `Verified Chaos Orb by exact metadata; no click sent.`
+8. Close the wanted picker, open the `I have` picker, and press F9. Confirm the query becomes `alteration` and status verifies Orb of Alteration by exact metadata.
+9. Put another window in the foreground or close the picker during a query. Confirm the operation faults immediately and sends no further characters.
+10. Press F, A, and Ctrl normally afterward to confirm no key remains held.
+11. Press F9 again while the search field remains focused and without clicking the picker. Confirm the hotkey is detected and Ctrl+A replaces the existing query rather than appending.
+12. Move to another area during or after a query. Confirm the query operation and preview clear.
+13. Press F6 on a selected pair. Confirm normal capture still updates `config/FaustusController/FaustusController_rate-captures.json` with corrected schema v1 data.
+
+### Mouse Movement Test
+
+1. Complete the F7 and F9 flow until query status reports an exact metadata match and the yellow target label is over that currency.
+2. Leave `AllowVerifiedTargetMouseMove` disabled, move the cursor away from the picker, and press F10. Confirm orange status reports the move was blocked and the cursor does not move.
+3. Enable `AllowVerifiedTargetMouseMove`, keep Path of Exile foreground, and press F10 once.
+4. Confirm the cursor follows a smooth curved path rather than teleporting, finishes at the center of the yellow exact option, orange status reports `no click sent`, the picker remains open, and no currency is selected.
+5. Repeat for the opposite picker side and from several starting distances. Confirm longer distances take longer while remaining within the 120-650 ms limits.
+6. Replace the query with an unrelated value that hides the verified target, then press F10. Confirm movement is blocked because the exact target is no longer visible.
+7. Close the picker or change picker sides before F10. Confirm movement is blocked.
+8. Put another application in the foreground and press F10. Confirm no cursor movement occurs outside Path of Exile.
+9. Start a longer tween and move the physical mouse away during movement. Confirm the tween cancels instead of fighting the user.
+10. Test lower and higher `CursorTweenSpeed` values and confirm movement duration changes without changing the endpoint.
+11. Move to another area and confirm the active tween cancels and F10 requires a new F7/F9 verification.
+
+The mouse movement test fails if the cursor teleports, lands outside the yellow target, fights manual movement, sends a mouse button event, closes the picker, selects a currency, uses stale data after the query/side changes, or moves while Path of Exile is not foreground.
+
+### Option Selection Test
+
+1. Complete F7, F9, and F10, and wait until the cursor tween reports completion at the exact yellow option.
+2. Leave `AllowVerifiedOptionClick` disabled and press F11. Confirm selection status reports the click was blocked and the picker remains open.
+3. Enable `AllowVerifiedOptionClick` and press F11 once without moving the cursor.
+4. Confirm exactly one click occurs, the picker closes, the intended wanted/offered currency is selected, and status reports `Verified panel selected <currency> after one click.`
+5. Repeat the complete F9/F10/F11 flow for the opposite picker side.
+6. Complete F10, move the cursor outside the option manually, and press F11. Confirm the click is blocked.
+7. Complete F10, then alter the query so the exact option disappears. Confirm F11 is blocked.
+8. Complete F10, then switch picker side or close the picker. Confirm F11 is blocked.
+9. Put another application in the foreground and press F11. Confirm no click occurs outside Path of Exile.
+10. Press F11 without a completed F10 tween. Confirm no click occurs.
+11. If panel selection verification times out, confirm status reports the failure and no second click is sent.
+
+The option selection test fails if F11 works while disabled, clicks without matching F9/F10 identities, clicks outside fresh option bounds, selects the wrong currency, leaves the mouse button held, retries automatically, or sends input outside the foreground visible picker.
+
+Runtime testing confirmed the F11 flow clicks exactly once, closes the picker, selects the correct metadata, and reports successful panel verification.
+
+### Picker-Button Calibration
+
+`CurrencyExchangePanel` does not expose public wanted/offered picker-button elements. Do not traverse hard-coded child indices. F12 instead arms one-time manual calibration:
+
+1. Record whether the picker is currently visible when calibration starts.
+2. Wait for a hidden-to-visible picker transition caused by the user's manual click.
+3. Require Path of Exile foreground and the cursor inside the panel rectangle.
+4. Use `CurrencyPicker.IsPickingWantedCurrency` to classify the click as `I want` or `I have`.
+5. Store cursor coordinates normalized to the current panel rectangle.
+6. Close the picker and repeat for the other side.
+7. Persist each captured side atomically to `config/FaustusController/FaustusController_picker-buttons.json` using schema v1.
+8. Render magenta `CALIBRATED I WANT` and `CALIBRATED I HAVE` labels at resolved positions for visual validation.
+
+Calibration sends no input. Starting F12 cancels query, tween, and selection operations. Area changes cancel an armed calibration but retain already saved points. Automatic picker opening must remain disabled until both resolved labels are confirmed over valid click locations.
+
+### Picker Calibration Test
+
+1. Reload the plugin, open Currency Exchange with the picker closed, and press F12.
+2. Confirm magenta status says calibration is armed.
+3. Manually click `I want` without moving the cursor afterward. Confirm status reports that `I want` was captured.
+4. Close the picker, then manually click `I have`. Confirm status reports calibration complete.
+5. Close the picker and verify magenta labels align with the exact locations clicked for both buttons.
+6. Move the game window or reopen the panel. Confirm labels remain aligned through panel-relative resolution.
+7. Inspect `config/FaustusController/FaustusController_picker-buttons.json`. Confirm schema version 1, both normalized points between 0 and 1, and an updated UTC timestamp.
+8. Reload the plugin. Confirm both labels are restored from JSON without recalibration.
+9. Press F12 while a picker is already open. Confirm status instructs closing it first and no point is captured until the next hidden-to-visible transition.
+10. Start calibration, then change areas. Confirm calibration disarms without input.
+
+The calibration test fails if opening one side is classified as the other, a point is outside the panel, labels do not align after panel movement, stale absolute screen coordinates are persisted, or any automated mouse/keyboard input occurs.
+
+Runtime testing confirmed both calibrated labels align with valid `I want` and `I have` click locations, remain aligned after panel/window movement, and reload correctly from schema-v1 JSON.
+
+### One Calibrated Picker Open
+
+F5 is the first automated picker-open increment. `AllowCalibratedPickerOpen` defaults to disabled. It requires an F7 preview, complete F12 calibration, foreground Path of Exile, visible exchange panel, closed picker, and no other running input operation.
+
+Choose exactly one side from current panel state:
+
+```text
+if current WantedItemType != planned wanted: open I want
+else if current OfferedItemType != planned offered: open I have
+else: pair already matches; send no input
+```
+
+The `CalibratedPickerOpenController` must:
+
+1. Resolve the calibrated normalized point against the fresh panel rectangle.
+2. Tween to it using the same speed, Bézier curve, smoothstep timing, 120-650 ms duration, and manual-interruption behavior as verified option movement.
+3. Re-resolve the calibrated point every tick and cancel if it moves more than 4 pixels.
+4. Revalidate foreground, visible panel, and closed picker throughout movement.
+5. Require the cursor within 6 pixels of the fresh calibrated point before clicking.
+6. Send one left-button down/up pair with unconditional release.
+7. Wait up to two seconds for the picker to become visible with the expected `IsPickingWantedCurrency` value.
+8. Never retry automatically.
+
+Starting a new preview or calibration and changing areas cancel picker opening. F8-F11 are blocked while it runs. Opening a picker clears prior query, cursor, and selection verification because those belonged to the previous picker state.
+
+### Calibrated Picker Open Test
+
+1. Reload complete F12 calibration and verify both magenta labels align.
+2. Press F7 and note the planned pair and which current side differs.
+3. Leave `AllowCalibratedPickerOpen` disabled and press F5. Confirm no movement or click occurs.
+4. Enable `AllowCalibratedPickerOpen`, close the picker, move the cursor away, and press F5 once.
+5. Confirm the cursor follows a curved tween to the required calibrated button, clicks once, and opens the expected `I want` or `I have` picker.
+6. Confirm magenta status reports `Verified calibrated <side> picker opened after one click.`
+7. Complete F9, F10, and F11 to select that planned currency.
+8. With the picker closed, press F5 again. Confirm it opens the remaining mismatched side.
+9. Select the second currency, then press F5 again. Confirm status says both currencies already match and no input occurs.
+10. Start F5 from a longer distance and manually move the mouse during the tween. Confirm cancellation without a click.
+11. Close the panel, open a picker manually, lose foreground, or disable the permission during F5. Confirm the operation cancels and never retries.
+
+The picker-open test fails if F5 works while disabled, opens the wrong side, clicks more than once, fights manual movement, retries after timeout, uses a stale panel position, runs concurrently with F8-F11, or sends input outside the foreground visible panel.
+
+Runtime testing confirmed F5 selects the required mismatched side, follows the calibrated tween/click path, verifies the expected picker, and sends no input when both planned currencies already match.
+
+### One Automated Pair
+
+F4 is the first orchestration increment. `AllowSinglePairAutomation` defaults to disabled and all lower-level permission toggles must also be enabled:
+
+```text
+AllowCalibratedPickerOpen
+AllowSearchQueryInput
+AllowVerifiedTargetMouseMove
+AllowVerifiedOptionClick
+```
+
+F4 requires an F7 preview, complete F12 calibration, foreground Path of Exile, visible exchange panel, closed picker, and no running manual input operation. Its state machine is:
+
+```text
+EnsurePair
+OpeningPicker
+EnteringQuery
+MovingToOption
+SelectingOption
+EnsurePair             repeat once if the other side differs
+WaitingForStableRate
+Completed              export one snapshot and stop
+Faulted                cancel without retry
+```
+
+Reuse the existing verified controllers rather than duplicating picker, keyboard, movement, or click logic. Select `I want` first when it differs, otherwise select `I have`. Skip either side that already matches exact metadata.
+
+After both panel item types match:
+
+1. Wait 500 ms before reading rates so pair-dependent UI state can settle.
+2. Poll every 100 ms.
+3. Require the captured pair metadata to equal the planned directed pair.
+4. Require a positive market rate.
+5. Require three consecutive identical raw `Get:Give` samples.
+6. Store the final immutable snapshot in `ExchangeRateBook` and export through the existing schema-v1 JSON exporter.
+7. Stop in `Completed`; never advance to the next plan step.
+
+The overall operation timeout is 30 seconds and the stable-rate timeout is 5 seconds. Losing foreground, changing areas, disabling any required permission, manual mouse interruption, controller failure, or timeout faults the run without automatic retry. Manual F5-F11 operations are blocked while F4 runs. F7 explicitly cancels F4 and creates a new preview.
+
+### Single-Pair Automation Test
+
+1. Reload complete calibration and enable all four lower-level permission toggles.
+2. Press F7 and record the exact planned offered/wanted pair.
+3. Leave `AllowSinglePairAutomation` disabled and press F4. Confirm no input occurs.
+4. Enable `AllowSinglePairAutomation`, close the picker, move the cursor away, and press F4 once.
+5. Do not press F5-F11. Confirm F4 automatically opens only each mismatched side, enters the expected query token, verifies metadata, tweens, clicks once, and verifies panel selection.
+6. Confirm it skips a side that already matches the planned metadata.
+7. After both sides match, confirm status waits 500 ms and reports stable-rate samples `1/3`, `2/3`, and `3/3`.
+8. Confirm final green status reports one captured directed pair and explicitly says `stopped`.
+9. Inspect `config/FaustusController/FaustusController_rate-captures.json`. Confirm the pair, raw market ratio, stock sides, selected-direction rates, and timestamp match the panel.
+10. Confirm F4 does not open another picker or advance to the next F7 plan step after export.
+11. Repeat with both sides initially mismatched and with one side already correct.
+12. During separate runs, disable one required permission, move the mouse during tweening, close the panel, change areas, and lose foreground. Confirm immediate fault with no retry or further input.
+13. Attempt F5-F11 during an active F4 run. Confirm those manual actions are blocked.
+14. Test a pair with no positive market rate. Confirm rate capture times out without exporting invalid data.
+
+The single-pair test fails if F4 works while disabled, bypasses a permission, selects incorrect metadata, advances beyond one pair, captures before three stable samples, exports a mismatched/no-rate snapshot, retries after fault, or allows concurrent manual input actions.
+
+### Bounded Multi-Pair Scan
+
+F3 composes the one-pair controller without duplicating picker or input behavior. `AllowBoundedScanAutomation` defaults to disabled, `PairsPerBoundedScan` defaults to 2, and the configured bound is limited to 1-10. All four lower-level permissions required by F4 are also required by F3; `AllowSinglePairAutomation` is independent and is not required for a bounded scan.
+
+F3 starts at the current F7 initial-scope preview and takes at most the configured number of unique steps, wrapping at the end of that scope without repeating a pair in one run. Each run receives an in-memory scan identifier and UTC start time. For every pair:
+
+1. Delegate selection and stable-rate capture to a private `SinglePairScanController`.
+2. Require the returned directed pair to equal the current planned pair.
+3. Require `CapturedAtUtc` to be at or after the batch start time.
+4. Reject duplicate directed pairs within the batch.
+5. Store and atomically export the snapshot while the scanner is in `AwaitingPersistence`.
+6. Advance only after persistence is confirmed.
+7. Wait 500 ms with a foreground, visible-panel, closed-picker guard before starting the next pair.
+8. Stop after the configured bound; never continue into an unbounded loop.
+
+The F3 hotkey is a start/cancel toggle while a run is active. F7 cancels the run and rebuilds the preview. F12 cancels it before calibration. Area change, foreground loss, panel/picker mismatch, permission loss, lower-controller failure, stale/mismatched/duplicate capture, or JSON export failure faults the batch without retry. Manual F4-F11 actions are blocked while F3 runs; blocked manual F5/F9/F10/F11 presses do not cancel the shared automated operation.
+
+### Bounded Scan Test
+
+1. Reload the plugin, verify F12 calibration, and enable the four picker/query/movement/click permissions.
+2. Set `PairsPerBoundedScan` to 2, leave `AllowBoundedScanAutomation` disabled, press F7, and record the initial-scope preview.
+3. Press F3 and confirm no cursor, key, or click input occurs and green status says the bounded scan is blocked.
+4. Enable `AllowBoundedScanAutomation`, close the picker, and press F3 once.
+5. Confirm status includes a short scan identifier and `pair 1/2`, and the first pair follows the complete verified F4 workflow.
+6. Confirm the first snapshot is exported before status changes to the 500 ms between-pair delay.
+7. Confirm the second pair starts without another hotkey press, uses the next initial-scope pair, and follows the same exact-metadata and stable-rate checks.
+8. Confirm final status reports two fresh persisted pairs and `stopped`, with no third picker opening.
+9. Inspect `config/FaustusController/FaustusController_rate-captures.json`; confirm both directed pairs have positive rates and capture timestamps at or after the F3 run start.
+10. Set the bound to 1 and confirm F3 behaves as a bounded one-pair batch. Set it to 3 and confirm exactly three unique pairs are exported.
+11. Start near the end of the initial scope and confirm wrapping does not duplicate a pair within the same run.
+12. During separate runs, press F3 again, press F7, press F12, disable each required permission, move the mouse during a tween, close the panel, open a picker during the between-pair delay, change area, and lose foreground. Confirm immediate cancellation with no retry or subsequent pair.
+13. During an active run, press F5 and F9-F11. Confirm each is reported as blocked and the automated run continues undisturbed. Press F4 and F6 and confirm no concurrent scan or manual capture starts.
+14. Make the export path unwritable for a controlled test. Confirm the current capture reports export failure and the scanner does not advance. Restore the path afterward.
+
+The bounded-scan test fails if F3 works while disabled, scans a reverse-scope pair, exceeds its configured bound, repeats a pair, accepts a pre-run/mismatched/no-rate snapshot, advances before successful persistence, retries input, or continues after explicit cancellation.
+
+The test fails if F7 generates input, F9 works while disabled, input continues after losing foreground/picker context, any key remains held, the entered token does not replace the old query, completion occurs without exact metadata, an option is clicked, duplicate scan pairs are created, or the plan size differs from `4N - 6`.
 
 ### Exact Rate Representation
 
@@ -135,7 +478,7 @@ An optimizer edge should reference the immutable snapshot it came from so route 
 
 ### Collection Freshness and History
 
-The current `ExchangeRateBook` stores only the latest snapshot per pair in its private `_latestByPair` dictionary. That dictionary exists only in the active plugin process. It is retained across area changes but lost on plugin reload or process exit.
+The current `ExchangeRateBook` stores only the latest snapshot per pair in its private `_latestByPair` dictionary. That dictionary exists only in the active plugin process. It is retained across area changes but lost on plugin reload or process exit. A bounded F3 run tracks an in-memory scan identifier, start time, latest capture time, and captured-pair set, but schema v1 does not yet persist the scan identifier.
 
 After every successful capture, export the rate book to:
 
@@ -153,8 +496,8 @@ Keep each stock row's raw ratio as well as its normalized selected-pair comparis
 
 1. Persist versioned snapshots separately from the static currency catalogue.
 2. Add a bounded history per directed pair and freshness/league metadata.
-3. Add a cancelable scanner state machine that opens one picker, selects by `ItemType.Metadata`, waits for panel state to stabilize, captures, then advances.
-4. Start scanning only `currency -> Chaos` and `currency -> Divine` pairs before attempting the full directed graph.
+3. Completed: add a cancelable bounded scanner that selects by `ItemType.Metadata`, waits for stable rates, persists, then advances.
+4. Current scope: scan only `currency -> Chaos` and `currency -> Divine` pairs before attempting the full directed graph.
 5. Build a graph where currencies are vertices and fresh executable quotes are directed edges.
 6. Add balances, stock/liquidity limits, gold costs, and whole-unit remainders to route simulation.
 7. Add bounded path search with cycle prevention and configurable maximum hops.
