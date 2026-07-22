@@ -19,6 +19,10 @@ public sealed class FaustusControllerSettings : ISettings
     public RangeNode<int> PairsPerBoundedScan { get; set; } = new(2, 1, 10);
     public RangeNode<int> MaximumQuoteAgeMinutes { get; set; } = new(15, 1, 1440);
     public RangeNode<int> CursorTweenSpeed { get; set; } = new(1600, 400, 4000);
+    public HotkeyNodeV2 RunRouteAnalysis { get; set; } = new(Keys.Home)
+    {
+        IgnoreFocusedInput = true
+    };
     public HotkeyNodeV2 RunBoundedScanAutomation { get; set; } = new(Keys.F3)
     {
         IgnoreFocusedInput = true

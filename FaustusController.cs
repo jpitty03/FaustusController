@@ -1,5 +1,6 @@
 ﻿using ExileCore;
 using ExileCore.PoEMemory.MemoryObjects;
+using Newtonsoft.Json;
 using System.Windows.Forms;
 using Vector2 = System.Numerics.Vector2;
 
@@ -26,6 +27,7 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
     private readonly RateCaptureJsonExporter _exporter = new();
     private readonly ActiveMarketDiscoveryExporter _marketDiscoveryExporter = new();
     private readonly CurrencyConversionGraphExporter _conversionGraphExporter = new();
+    private readonly CurrencyRouteAnalyzer _routeAnalyzer = new();
     private readonly Guid _collectorSessionId = Guid.NewGuid();
     private long _lastAttemptedBoundedScanRevision = -1;
     private long _lastPersistedBoundedScanRevision = -1;
@@ -47,6 +49,8 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
     private string _marketDiscoveryPath = "";
     private string _conversionGraphPath = "";
     private string _activeRefreshPlanPath = "";
+    private string _routeRequestPath = "";
+    private string _routeAnalysisPath = "";
     private bool _activeRefreshPlanDirty;
     private DateTimeOffset _nextActiveRefreshPlanRetryUtc;
     private string _discoveryProbePath = "";
@@ -60,6 +64,8 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
     private string _marketDiscoveryStatus = "Active-market discovery is waiting for the live catalogue.";
     private string _conversionGraphStatus = "Conversion graph is waiting for the live catalogue.";
     private string _activeRefreshStatus = "Active refresh plan is waiting for discovery.";
+    private string _routeAnalysisStatus = "Press Home to create/run exact route analysis.";
+    private CurrencyRouteAnalysisFile? _lastRouteAnalysis;
     private string _scanStatus = "Press F7 to build and preview the next scan step.";
     private string _inputStatus = "Search focus input is disabled by default.";
 
@@ -75,6 +81,7 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         Settings.RunBoundedScanAutomation.IgnoreFocusedInput = true;
         Settings.RunLiquidityDiscoveryAutomation.IgnoreFocusedInput = true;
         Settings.RunActiveRefreshAutomation.IgnoreFocusedInput = true;
+        Settings.RunRouteAnalysis.IgnoreFocusedInput = true;
         _exportPath = Path.Combine(ConfigDirectory, "FaustusController_rate-captures.json");
         _pickerButtonCalibrationPath = Path.Combine(
             ConfigDirectory,
@@ -229,6 +236,11 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         if (Settings.RunActiveRefreshAutomation.PressedOnce())
         {
             ToggleActiveRefreshAutomation();
+        }
+
+        if (Settings.RunRouteAnalysis.PressedOnce())
+        {
+            RunRouteAnalysis();
         }
 
         if (Settings.RunSinglePairAutomation.PressedOnce())
@@ -1536,7 +1548,8 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             if (!EnsureDiscoveryProbeRegistry())
             {
                 throw new InvalidOperationException(
-                    "Discovery-probe registry is unavailable for graph coherence validation.");
+                    $"Discovery-probe registry is unavailable for graph coherence validation. " +
+                    $"Market discovery status: {_marketDiscoveryStatus}");
             }
 
             LatestBoundedScanManifest? completedManifest = null;
@@ -2077,6 +2090,97 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         _ = RefreshMarketDiscovery();
     }
 
+    private void RunRouteAnalysis()
+    {
+        if (IsAnyAutomationRunning)
+        {
+            _routeAnalysisStatus = "Route analysis blocked: automated scan is running.";
+            return;
+        }
+
+        if (_catalogue == null)
+        {
+            _routeAnalysisStatus = "Route analysis blocked: the live catalogue is unavailable.";
+            return;
+        }
+
+        var league = GetCurrentLeague();
+        if (string.IsNullOrWhiteSpace(league))
+        {
+            _routeAnalysisStatus = "Route analysis blocked: the current league is unavailable.";
+            return;
+        }
+
+        try
+        {
+            if (!RefreshConversionGraph())
+            {
+                throw new InvalidOperationException(_conversionGraphStatus);
+            }
+
+            var sanitizedLeague = SanitizeFileName(league);
+            _routeRequestPath = Path.Combine(
+                ConfigDirectory,
+                $"FaustusController_route-request-{sanitizedLeague}.json");
+            _routeAnalysisPath = Path.Combine(
+                ConfigDirectory,
+                $"FaustusController_route-analysis-{sanitizedLeague}.json");
+            var result = _routeAnalyzer.Analyze(
+                _catalogue,
+                league,
+                _conversionGraphPath,
+                _routeRequestPath,
+                _routeAnalysisPath,
+                DateTimeOffset.UtcNow);
+            _routeAnalysisStatus = result.RouteFound
+                ? $"Route analysis: best output {result.BestTargetUnits}; " +
+                    $"{result.CandidateRouteCount} candidates, {result.FreshEdgeCount} fresh edges" +
+                    (result.SearchTruncated ? "; SEARCH TRUNCATED." : ".") +
+                    FormatRouteConstraints(result)
+                : $"Route analysis found no executable whole-unit route across " +
+                    $"{result.FreshEdgeCount} fresh edges; {result.ExpiredEdgeCount} expired." +
+                    FormatRouteConstraints(result);
+
+            try
+            {
+                _lastRouteAnalysis = JsonConvert.DeserializeObject<CurrencyRouteAnalysisFile>(
+                    File.ReadAllText(_routeAnalysisPath));
+            }
+            catch
+            {
+                _lastRouteAnalysis = null;
+            }
+        }
+        catch (Exception exception)
+        {
+            _routeAnalysisStatus = $"Route analysis failed: {exception.Message}";
+            _lastRouteAnalysis = null;
+        }
+    }
+
+    private static string FormatRouteConstraints(CurrencyRouteAnalysisResult result)
+    {
+        var constraints = new List<string>();
+        if (result.UsesInventoryBalances)
+        {
+            constraints.Add("inventory balances");
+        }
+
+        if (result.UsesLiquidityLimits)
+        {
+            constraints.Add("liquidity limits");
+        }
+
+        if (result.UsesGoldCosts)
+        {
+            constraints.Add("gold costs");
+        }
+
+        return constraints.Count > 0
+            ? $" [{string.Join(", ", constraints)}]"
+            : "";
+    }
+
     private string GetCurrentLeague()
     {
         try
@@ -2103,6 +2207,130 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
     private static string FormatRatio(RationalExchangeRate? rate)
     {
         return rate == null ? "unavailable" : $"{rate.GetUnits}:{rate.GiveUnits}";
+    }
+
+    private void RenderRouteAnalysis(int startY)
+    {
+        var analysis = _lastRouteAnalysis;
+        if (analysis == null || analysis.BestRoute == null)
+        {
+            return;
+        }
+
+        var y = startY;
+        var x = 100;
+        var best = analysis.BestRoute;
+
+        Graphics.DrawText(
+            $"=== ROUTE ANALYSIS DRY RUN (Rank {best.Rank}) ===",
+            new Vector2(x, y),
+            SharpDX.Color.White);
+        y += 20;
+
+        Graphics.DrawText(
+            $"{analysis.Request.StartAmount} {best.Hops.FirstOrDefault()?.OfferedCurrency.Name} " +
+            $"-> {best.TargetUnits} {best.TargetCurrency.Name} " +
+            $"in {best.HopCount} hops | gold: {best.TotalGoldCost} | " +
+            $"stranded: {best.StrandedRemainderCurrencyCount} currency",
+            new Vector2(x, y),
+            SharpDX.Color.Cyan);
+        y += 20;
+
+        foreach (var hop in best.Hops)
+        {
+            Graphics.DrawText(
+                $"  Hop {hop.Sequence}: {hop.OfferedCurrency.Name} -> {hop.WantedCurrency.Name}",
+                new Vector2(x, y),
+                SharpDX.Color.White);
+            y += 20;
+
+            Graphics.DrawText(
+                $"    avail: {hop.AvailableBefore} | lots: {hop.Lots} | " +
+                $"rate: {hop.GetUnitsPerLot}:{hop.GiveUnitsPerLot} | " +
+                $"spent: {hop.Spent} | recv: {hop.Received} | rem: {hop.Remainder}",
+                new Vector2(x, y),
+                SharpDX.Color.White);
+            y += 20;
+
+            var liquidityLabel = analysis.UsesLiquidityLimits
+                ? $"fillable: {hop.FillableLots} | capped: {hop.LotsCappedByLiquidity.ToString().ToLowerInvariant()}"
+                : "liquidity: disabled";
+            Graphics.DrawText(
+                $"    {hop.BookSide} | {hop.Coherence} | gold: {hop.GoldCost} | {liquidityLabel}",
+                new Vector2(x, y),
+                SharpDX.Color.White);
+            y += 20;
+        }
+
+        foreach (var remainder in best.Remainders.Where(r => r.Units > 0))
+        {
+            Graphics.DrawText(
+                $"  Remainder: {remainder.Units} {remainder.Currency.Name}",
+                new Vector2(x, y),
+                SharpDX.Color.Yellow);
+            y += 20;
+        }
+
+        var rejectionParts = new List<string>();
+        if (analysis.RejectedCycleCount > 0)
+        {
+            rejectionParts.Add($"cycles {analysis.RejectedCycleCount}");
+        }
+
+        if (analysis.RejectedZeroLotCount > 0)
+        {
+            rejectionParts.Add($"zero-lot {analysis.RejectedZeroLotCount}");
+        }
+
+        if (analysis.RejectedOverflowCount > 0)
+        {
+            rejectionParts.Add($"overflow {analysis.RejectedOverflowCount}");
+        }
+
+        if (analysis.RejectedLiquidityLimitCount > 0)
+        {
+            rejectionParts.Add($"liquidity {analysis.RejectedLiquidityLimitCount}");
+        }
+
+        if (analysis.RejectedGoldBudgetCount > 0)
+        {
+            rejectionParts.Add($"gold {analysis.RejectedGoldBudgetCount}");
+        }
+
+        var rejectionLabel = rejectionParts.Count > 0
+            ? string.Join(", ", rejectionParts)
+            : "none";
+        Graphics.DrawText(
+            $"Candidates: {analysis.CandidateRouteCount} | expanded: {analysis.ExpandedStateCount} | " +
+            $"rejected: {rejectionLabel}",
+            new Vector2(x, y),
+            SharpDX.Color.Orange);
+        y += 20;
+
+        var constraintParts = new List<string>();
+        if (analysis.UsesInventoryBalances)
+        {
+            constraintParts.Add("inventory balances");
+        }
+
+        if (analysis.UsesLiquidityLimits)
+        {
+            constraintParts.Add("liquidity limits");
+        }
+
+        if (analysis.UsesGoldCosts)
+        {
+            constraintParts.Add("gold costs");
+        }
+
+        var constraintLabel = constraintParts.Count > 0
+            ? string.Join(", ", constraintParts)
+            : "none";
+        Graphics.DrawText(
+            $"Constraints: {constraintLabel} | truncated: {analysis.SearchTruncated.ToString().ToLowerInvariant()} | " +
+            $"routes: {analysis.Routes.Count}",
+            new Vector2(x, y),
+            SharpDX.Color.Orange);
     }
 
     public override void Render()
@@ -2166,6 +2394,12 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             _activeRefreshStatus,
             new Vector2(100, 400),
             SharpDX.Color.Cyan);
+        Graphics.DrawText(
+            _routeAnalysisStatus,
+            new Vector2(100, 420),
+            SharpDX.Color.Cyan);
+
+        RenderRouteAnalysis(440);
 
         if (_previewTarget != null)
         {

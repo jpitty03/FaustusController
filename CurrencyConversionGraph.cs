@@ -284,6 +284,7 @@ public sealed class CurrencyConversionGraphExporter
                 snapshot.OfferedCurrency.Metadata,
                 snapshot.WantedCurrency.Metadata,
                 immediateRate,
+                snapshot.TopImmediateStock?.ListedCount ?? 0,
                 coherence,
                 "ImmediateBook",
                 generatedAtUtc);
@@ -296,6 +297,7 @@ public sealed class CurrencyConversionGraphExporter
                 snapshot.WantedCurrency.Metadata,
                 snapshot.OfferedCurrency.Metadata,
                 competingRate,
+                snapshot.TopCompetingStock?.ListedCount ?? 0,
                 coherence,
                 "CompetingBook",
                 generatedAtUtc);
@@ -307,6 +309,7 @@ public sealed class CurrencyConversionGraphExporter
         string offeredMetadata,
         string wantedMetadata,
         RationalExchangeRate rate,
+        int listedCount,
         string coherence,
         string bookSide,
         DateTimeOffset generatedAtUtc)
@@ -328,7 +331,8 @@ public sealed class CurrencyConversionGraphExporter
             RawGive = rate.RawGive,
             GetUnits = rate.GetUnits,
             GiveUnits = rate.GiveUnits,
-            WantedPerOffered = rate.WantedPerOffered
+            WantedPerOffered = rate.WantedPerOffered,
+            ListedCount = listedCount
         };
     }
 
@@ -381,6 +385,7 @@ public sealed class CurrencyConversionGraphExporter
                 !RationalExchangeRate.TryCreate(edge.RawGet, edge.RawGive, out var rate) ||
                 rate!.GetUnits != edge.GetUnits || rate.GiveUnits != edge.GiveUnits ||
                 rate.WantedPerOffered != edge.WantedPerOffered ||
+                edge.ListedCount < 0 ||
                 edge.BookSide is not "ImmediateBook" and not "CompetingBook" ||
                 edge.Coherence is not "ActiveDiscoveryProbe" and not "CompletedBoundedScan")
             {
@@ -427,4 +432,5 @@ public sealed class CurrencyConversionGraphEdgeCapture
     public int GetUnits { get; set; }
     public int GiveUnits { get; set; }
     public decimal WantedPerOffered { get; set; }
+    public int ListedCount { get; set; }
 }
