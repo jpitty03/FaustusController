@@ -21,6 +21,7 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
     private readonly LiquidityDiscoveryController _liquidityDiscoveryController = new();
     private readonly CurrencyDiscoveryProbeStore _discoveryProbeStore = new();
     private readonly CurrencyDiscoveryOverrideStore _discoveryOverrideStore = new();
+    private readonly ActiveRefreshPlanExporter _activeRefreshPlanExporter = new();
     private readonly ExchangeRateBook _rateBook = new();
     private readonly RateCaptureJsonExporter _exporter = new();
     private readonly ActiveMarketDiscoveryExporter _marketDiscoveryExporter = new();
@@ -45,15 +46,20 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
     private string _pickerButtonCalibrationPath = "";
     private string _marketDiscoveryPath = "";
     private string _conversionGraphPath = "";
+    private string _activeRefreshPlanPath = "";
+    private bool _activeRefreshPlanDirty;
+    private DateTimeOffset _nextActiveRefreshPlanRetryUtc;
     private string _discoveryProbePath = "";
     private string _discoveryProbeLeague = "";
     private Dictionary<CurrencyPairKey, CurrencyDiscoveryProbeOutcome> _discoveryProbeOutcomes = [];
     private string _discoveryOverridePath = "";
     private string _discoveryOverrideLeague = "";
     private CurrencyDiscoveryOverrides _discoveryOverrides = CurrencyDiscoveryOverrides.Empty;
+    private bool _activeRefreshRun;
     private string _exportStatus = "";
     private string _marketDiscoveryStatus = "Active-market discovery is waiting for the live catalogue.";
     private string _conversionGraphStatus = "Conversion graph is waiting for the live catalogue.";
+    private string _activeRefreshStatus = "Active refresh plan is waiting for discovery.";
     private string _scanStatus = "Press F7 to build and preview the next scan step.";
     private string _inputStatus = "Search focus input is disabled by default.";
 
@@ -68,6 +74,7 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         Settings.RunSinglePairAutomation.IgnoreFocusedInput = true;
         Settings.RunBoundedScanAutomation.IgnoreFocusedInput = true;
         Settings.RunLiquidityDiscoveryAutomation.IgnoreFocusedInput = true;
+        Settings.RunActiveRefreshAutomation.IgnoreFocusedInput = true;
         _exportPath = Path.Combine(ConfigDirectory, "FaustusController_rate-captures.json");
         _pickerButtonCalibrationPath = Path.Combine(
             ConfigDirectory,
@@ -219,6 +226,11 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             ToggleLiquidityDiscoveryAutomation();
         }
 
+        if (Settings.RunActiveRefreshAutomation.PressedOnce())
+        {
+            ToggleActiveRefreshAutomation();
+        }
+
         if (Settings.RunSinglePairAutomation.PressedOnce())
         {
             StartSinglePairAutomation();
@@ -272,10 +284,13 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         }
 
         if (_liquidityDiscoveryController.IsRunning &&
-            !AreLiquidityDiscoveryPermissionsEnabled())
+            !(_activeRefreshRun
+                ? AreActiveRefreshPermissionsEnabled()
+                : AreLiquidityDiscoveryPermissionsEnabled()))
         {
             CancelLiquidityDiscovery(
-                "Liquidity discovery cancelled: one or more required permission toggles were disabled.");
+                $"{(_activeRefreshRun ? "Active refresh" : "Liquidity discovery")} cancelled: " +
+                    "one or more required permission toggles were disabled.");
         }
 
         if (_catalogue != null)
@@ -438,11 +453,26 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             }
         }
 
+        if (_activeRefreshRun && !_liquidityDiscoveryController.IsRunning &&
+            _liquidityDiscoveryController.State is LiquidityDiscoveryState.Completed or
+                LiquidityDiscoveryState.Faulted)
+        {
+            _activeRefreshRun = false;
+            _ = TryExportActiveRefreshPlan(GetActiveRefreshRunPlan(), out _);
+        }
+
         PersistBoundedScanProgressIfChanged();
         if (_marketDiscoveryDirty && _catalogue != null &&
             DateTimeOffset.UtcNow >= _nextMarketDiscoveryRetryUtc)
         {
             _ = RefreshMarketDiscovery();
+        }
+
+        if (_activeRefreshPlanDirty && !_activeRefreshRun && _catalogue != null &&
+            _scanPlan != null && DateTimeOffset.UtcNow >= _nextActiveRefreshPlanRetryUtc &&
+            EnsureDiscoveryProbeRegistry())
+        {
+            _ = TryExportActiveRefreshPlan(GetActiveRefreshRunPlan(), out _);
         }
 
         if (_catalogue != null &&
@@ -1101,6 +1131,12 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
     {
         if (_liquidityDiscoveryController.IsRunning)
         {
+            if (_activeRefreshRun)
+            {
+                _inputStatus = "F2 discovery blocked: Insert active refresh is running.";
+                return;
+            }
+
             CancelLiquidityDiscovery("Liquidity discovery cancelled by F2; no retry sent.");
             return;
         }
@@ -1119,17 +1155,55 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             return;
         }
 
+        StartLiquidityAutomation(activeRefresh: false);
+    }
+
+    private void ToggleActiveRefreshAutomation()
+    {
+        if (_liquidityDiscoveryController.IsRunning)
+        {
+            if (!_activeRefreshRun)
+            {
+                _inputStatus = "Insert active refresh blocked: F2 discovery is running.";
+                return;
+            }
+
+            CancelLiquidityDiscovery("Active refresh cancelled by Insert; no retry sent.");
+            return;
+        }
+
+        if (!Settings.AllowActiveRefreshAutomation)
+        {
+            _liquidityDiscoveryController.Block(
+                "Active refresh blocked: enable Allow Active Refresh Automation first.");
+            return;
+        }
+
+        if (!AreActiveRefreshPermissionsEnabled())
+        {
+            _liquidityDiscoveryController.Block(
+                "Active refresh blocked: enable all picker, query, movement, and click permissions.");
+            return;
+        }
+
+        StartLiquidityAutomation(activeRefresh: true);
+    }
+
+    private void StartLiquidityAutomation(bool activeRefresh)
+    {
+        var operation = activeRefresh ? "Active refresh" : "Liquidity discovery";
+
         if (_singlePairScanController.IsRunning || _boundedScanController.IsRunning)
         {
             _liquidityDiscoveryController.Block(
-                "Liquidity discovery blocked: another automated scan is running.");
+                $"{operation} blocked: another automated scan is running.");
             return;
         }
 
         if (_catalogue == null)
         {
             _liquidityDiscoveryController.Block(
-                "Liquidity discovery blocked: the live catalogue is not available yet.");
+                $"{operation} blocked: the live catalogue is not available yet.");
             return;
         }
 
@@ -1137,14 +1211,14 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             !CurrencyScanPlan.TryCreate(_catalogue, out _scanPlan, out var planFailure))
         {
             _liquidityDiscoveryController.Block(
-                $"Liquidity discovery blocked: {planFailure}");
+                $"{operation} blocked: {planFailure}");
             return;
         }
 
         if (!_pickerButtonCalibration.IsComplete)
         {
             _liquidityDiscoveryController.Block(
-                "Liquidity discovery blocked: complete F12 calibration first.");
+                $"{operation} blocked: complete F12 calibration first.");
             return;
         }
 
@@ -1152,7 +1226,7 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             _cursorTweenController.IsRunning || _selectionController.IsRunning)
         {
             _liquidityDiscoveryController.Block(
-                "Liquidity discovery blocked: another input operation is running.");
+                $"{operation} blocked: another input operation is running.");
             return;
         }
 
@@ -1160,21 +1234,52 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             !EnsureDiscoveryProbeRegistry())
         {
             _liquidityDiscoveryController.Block(
-                "Liquidity discovery blocked: probe registry or manual overrides could not be loaded.");
+                $"{operation} blocked: probe registry or manual overrides could not be loaded.");
             return;
         }
 
-        var plan = GetLiquidityDiscoveryRunPlan();
+        var plan = activeRefresh
+            ? GetActiveRefreshRunPlan()
+            : GetLiquidityDiscoveryRunPlan();
+        if (activeRefresh)
+        {
+            if (!TryExportActiveRefreshPlan(plan, out var refreshFailure))
+            {
+                _liquidityDiscoveryController.Block(
+                    $"Active refresh blocked: {refreshFailure}");
+                return;
+            }
+        }
+        else if (plan.Steps.Count == 0)
+        {
+            _liquidityDiscoveryController.Block(
+                "Full discovery is complete. Use Insert for directed active refresh.");
+            if (!_activeRefreshRun || !_liquidityDiscoveryController.IsRunning)
+            {
+                _ = TryExportActiveRefreshPlan(GetActiveRefreshRunPlan(), out _);
+            }
+            return;
+        }
 
-        _pickerOpenController.Cancel("Picker opener reset for liquidity discovery.");
-        _searchQueryController.Cancel("Query controller reset for liquidity discovery.");
-        _cursorTweenController.Cancel("Cursor tween reset for liquidity discovery.");
-        _selectionController.Cancel("Selection controller reset for liquidity discovery.");
-        _liquidityDiscoveryController.Start(
+        if (plan.Steps.Count == 0)
+        {
+            _liquidityDiscoveryController.Block(
+                "Active refresh blocked: the directed refresh plan contains no pairs.");
+            return;
+        }
+
+        _pickerOpenController.Cancel($"Picker opener reset for {operation.ToLowerInvariant()}.");
+        _searchQueryController.Cancel($"Query controller reset for {operation.ToLowerInvariant()}.");
+        _cursorTweenController.Cancel($"Cursor tween reset for {operation.ToLowerInvariant()}.");
+        _selectionController.Cancel($"Selection controller reset for {operation.ToLowerInvariant()}.");
+        if (_liquidityDiscoveryController.Start(
             GameController,
             plan.Steps,
             out _,
-            plan.Label);
+            plan.Label))
+        {
+            _activeRefreshRun = activeRefresh;
+        }
     }
 
     private bool AreSinglePairPermissionsEnabled()
@@ -1198,6 +1303,15 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
     private bool AreLiquidityDiscoveryPermissionsEnabled()
     {
         return Settings.AllowLiquidityDiscoveryAutomation &&
+            Settings.AllowCalibratedPickerOpen &&
+            Settings.AllowSearchQueryInput &&
+            Settings.AllowVerifiedTargetMouseMove &&
+            Settings.AllowVerifiedOptionClick;
+    }
+
+    private bool AreActiveRefreshPermissionsEnabled()
+    {
+        return Settings.AllowActiveRefreshAutomation &&
             Settings.AllowCalibratedPickerOpen &&
             Settings.AllowSearchQueryInput &&
             Settings.AllowVerifiedTargetMouseMove &&
@@ -1385,6 +1499,10 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             _conversionGraphDirty = true;
             _nextConversionGraphRetryUtc = DateTimeOffset.UtcNow;
             _ = RefreshConversionGraph();
+            if (!_activeRefreshRun || !_liquidityDiscoveryController.IsRunning)
+            {
+                _ = TryExportActiveRefreshPlan(GetActiveRefreshRunPlan(), out _);
+            }
             return true;
         }
         catch (Exception exception)
@@ -1482,36 +1600,7 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         var phaseOne = _scanPlan.InitialCollectionSteps
             .Where(step => !IsManuallySkipped(step, overrides))
             .ToArray();
-        var phaseOneComplete = phaseOne.All(step =>
-            outcomes.TryGetValue(step.Pair, out var outcome) &&
-            outcome.Status is CurrencyDiscoveryProbeStatus.Active or
-                CurrencyDiscoveryProbeStatus.NoMarketRate or
-                CurrencyDiscoveryProbeStatus.Unavailable);
-        if (!phaseOneComplete)
-        {
-            return phaseOne;
-        }
-
-        var stepsByPair = _scanPlan.Steps.ToDictionary(step => step.Pair);
-        var phaseOnePairs = phaseOne.Select(step => step.Pair).ToHashSet();
-        var reverseSteps = phaseOne
-            .Where(step => outcomes.TryGetValue(step.Pair, out var outcome) &&
-                outcome.Status == CurrencyDiscoveryProbeStatus.Active ||
-                IsManuallyIncluded(step, overrides) ||
-                outcomes.TryGetValue(
-                    new CurrencyPairKey(
-                        step.WantedCurrency.Metadata,
-                        step.OfferedCurrency.Metadata),
-                    out var reverseOutcome) &&
-                reverseOutcome.Status == CurrencyDiscoveryProbeStatus.Active)
-            .Select(step => new CurrencyPairKey(
-                step.WantedCurrency.Metadata,
-                step.OfferedCurrency.Metadata))
-            .Where(pair => !phaseOnePairs.Contains(pair))
-            .Distinct()
-            .Select(pair => stepsByPair[pair])
-            .OrderBy(step => step.Index);
-        return phaseOne.Concat(reverseSteps).ToArray();
+        return phaseOne;
     }
 
     private LiquidityDiscoveryRunPlan GetLiquidityDiscoveryRunPlan()
@@ -1529,16 +1618,33 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
                 .ToHashSet();
             var label = unresolved.Any(step => phaseOnePairs.Contains(step.Pair))
                 ? "Full initial discovery"
-                : "Active-candidate reverse discovery";
-            return new LiquidityDiscoveryRunPlan(label, unresolved);
+                : "Full canonical discovery";
+            return new LiquidityDiscoveryRunPlan(label, unresolved, false);
         }
 
-        var activeRefresh = eligible
+        return new LiquidityDiscoveryRunPlan("Full discovery complete", [], true);
+    }
+
+    private LiquidityDiscoveryRunPlan GetActiveRefreshRunPlan()
+    {
+        var discoveryPlan = GetLiquidityDiscoveryRunPlan();
+        if (!discoveryPlan.DiscoveryComplete)
+        {
+            return new LiquidityDiscoveryRunPlan(
+                "Directed active refresh unavailable: F2 discovery is incomplete",
+                [],
+                false);
+        }
+
+        var activeRefresh = GetEligibleLiquidityDiscoverySteps()
             .Where(step => IsManuallyIncluded(step) ||
                 _discoveryProbeOutcomes.TryGetValue(step.Pair, out var outcome) &&
                 outcome.Status == CurrencyDiscoveryProbeStatus.Active)
             .ToArray();
-        return new LiquidityDiscoveryRunPlan("Active listing refresh", activeRefresh);
+        return new LiquidityDiscoveryRunPlan(
+            "Directed active listing refresh",
+            activeRefresh,
+            true);
     }
 
     private bool IsManuallyIncluded(
@@ -1565,7 +1671,8 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
 
     private readonly record struct LiquidityDiscoveryRunPlan(
         string Label,
-        IReadOnlyList<CurrencyScanPlanStep> Steps);
+        IReadOnlyList<CurrencyScanPlanStep> Steps,
+        bool DiscoveryComplete);
 
     private void SyncPositiveProbeOutcomes(
         IReadOnlyCollection<ExchangePairSnapshot> snapshots)
@@ -1588,7 +1695,7 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
                     snapshot.League,
                     _discoveryProbeLeague,
                     StringComparison.Ordinal) ||
-                snapshot.MarketRate == null ||
+                snapshot.TopImmediateStock == null && snapshot.TopCompetingStock == null ||
                 !eligiblePairs.Contains(snapshot.Pair) ||
                 updated.TryGetValue(snapshot.Pair, out var existing) &&
                     existing.ObservedAtUtc >= snapshot.CapturedAtUtc)
@@ -1722,6 +1829,68 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             $"FaustusController_discovery-overrides-{SanitizeFileName(league)}.json");
     }
 
+    private string GetActiveRefreshPlanPath(string league)
+    {
+        return Path.Combine(
+            ConfigDirectory,
+            $"FaustusController_refresh-plan-{SanitizeFileName(league)}.json");
+    }
+
+    private bool TryExportActiveRefreshPlan(
+        LiquidityDiscoveryRunPlan plan,
+        out string failureReason)
+    {
+        if (_catalogue == null)
+        {
+            failureReason = "the live catalogue is unavailable.";
+            _activeRefreshStatus = $"Active refresh plan failed: {failureReason}";
+            return false;
+        }
+
+        var league = GetCurrentLeague();
+        if (string.IsNullOrWhiteSpace(league))
+        {
+            failureReason = "the current league is unavailable.";
+            _activeRefreshStatus = $"Active refresh plan failed: {failureReason}";
+            return false;
+        }
+
+        try
+        {
+            _activeRefreshPlanPath = GetActiveRefreshPlanPath(league);
+            var result = _activeRefreshPlanExporter.Export(
+                _catalogue,
+                league,
+                plan.DiscoveryComplete,
+                plan.DiscoveryComplete ? plan.Steps : [],
+                _discoveryProbeOutcomes,
+                _discoveryOverrides,
+                _activeRefreshPlanPath);
+            _activeRefreshStatus = result.Ready
+                ? $"Insert refresh plan: {result.PairCount} directed pairs " +
+                    $"({result.CanonicalActivePairCount} canonical active, " +
+                    $"{result.ForceIncludedPairCount} forced)."
+                    : "Insert refresh plan is not ready: complete F2 discovery first.";
+            _activeRefreshPlanDirty = false;
+            if (!result.Ready)
+            {
+                failureReason = "F2 discovery still has unresolved directed pairs.";
+                return false;
+            }
+
+            failureReason = string.Empty;
+            return true;
+        }
+        catch (Exception exception)
+        {
+            failureReason = $"refresh-plan export failed: {exception.Message}";
+            _activeRefreshStatus = $"Active refresh plan failed: {exception.Message}";
+            _activeRefreshPlanDirty = true;
+            _nextActiveRefreshPlanRetryUtc = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(2);
+            return false;
+        }
+    }
+
     private bool EnsureDiscoveryOverrides(bool forceReload = false)
     {
         if (_catalogue == null)
@@ -1842,6 +2011,18 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             ? _discoveryProbeOutcomes
             : _discoveryProbeStore.Load(probePath, pendingProbe.League)
                 .ToDictionary(item => item.Pair);
+        if (_activeRefreshRun &&
+            pendingProbe.Status == CurrencyDiscoveryProbeStatus.Failed &&
+            sourceOutcomes.TryGetValue(outcome.Pair, out var priorOutcome) &&
+            priorOutcome.Status != CurrencyDiscoveryProbeStatus.Failed)
+        {
+            _exportStatus = "Active refresh failed without replacing the prior terminal " +
+                $"{priorOutcome.Status} outcome for " +
+                $"{pendingProbe.Step.OfferedCurrency.Name} -> " +
+                $"{pendingProbe.Step.WantedCurrency.Name}.";
+            return true;
+        }
+
         var updated = new Dictionary<CurrencyPairKey, CurrencyDiscoveryProbeOutcome>(
             sourceOutcomes)
         {
@@ -1858,7 +2039,7 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
                 probePath);
             if (!isCurrentRegistry)
             {
-                return pendingProbe.Status == CurrencyDiscoveryProbeStatus.Failed;
+                return true;
             }
 
             _discoveryProbeOutcomes = updated;
@@ -1980,6 +2161,10 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         Graphics.DrawText(
             _conversionGraphStatus,
             new Vector2(100, 380),
+            SharpDX.Color.Cyan);
+        Graphics.DrawText(
+            _activeRefreshStatus,
+            new Vector2(100, 400),
             SharpDX.Color.Cyan);
 
         if (_previewTarget != null)

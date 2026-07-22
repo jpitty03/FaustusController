@@ -39,7 +39,8 @@ public sealed class CurrencyConversionGraphExporter
             currency => currency.Metadata,
             StringComparer.Ordinal);
         var currentLeagueSnapshots = snapshots
-            .Where(snapshot => string.Equals(snapshot.League, league, StringComparison.Ordinal))
+            .Where(snapshot => string.Equals(snapshot.League, league, StringComparison.Ordinal) &&
+                IsCanonicalPair(catalogue, snapshot.Pair))
             .ToArray();
         if (currentLeagueSnapshots.Select(snapshot => snapshot.Pair).Distinct().Count() !=
             currentLeagueSnapshots.Length)
@@ -65,12 +66,6 @@ public sealed class CurrencyConversionGraphExporter
 
         foreach (var snapshot in currentLeagueSnapshots)
         {
-            if (snapshot.MarketRate == null)
-            {
-                excludedNullRate++;
-                continue;
-            }
-
             if (!catalogueByMetadata.ContainsKey(snapshot.OfferedCurrency.Metadata) ||
                 !catalogueByMetadata.ContainsKey(snapshot.WantedCurrency.Metadata) ||
                 snapshot.OfferedCurrency.Metadata == snapshot.WantedCurrency.Metadata)
@@ -110,7 +105,14 @@ public sealed class CurrencyConversionGraphExporter
                 continue;
             }
 
-            edges.Add(CreateEdge(snapshot, coherence, generatedAtUtc));
+            var candidateEdges = CreateEdges(snapshot, coherence, generatedAtUtc).ToArray();
+            if (candidateEdges.Length == 0)
+            {
+                excludedNullRate++;
+                continue;
+            }
+
+            edges.AddRange(candidateEdges);
         }
 
         var file = new CurrencyConversionGraphFile
@@ -120,7 +122,7 @@ public sealed class CurrencyConversionGraphExporter
             League = league,
             MaximumQuoteAgeMinutes = (int)maximumQuoteAge.TotalMinutes,
             VertexCount = catalogue.Items.Count,
-            EdgeCount = edges.Count,
+            EdgeCount = SelectLatestEdges(edges).Count,
             CurrentLeagueCaptureCount =
                 currentLeagueSnapshots.Length + preExcludedIncoherentCount,
             ExcludedNullRateCount = excludedNullRate,
@@ -130,10 +132,7 @@ public sealed class CurrencyConversionGraphExporter
             ExcludedIncoherentCount = excludedIncoherent,
             ExcludedManualSkipCount = excludedManualSkip,
             Vertices = catalogue.Items.Select(CreateCurrency).ToList(),
-            Edges = edges
-                .OrderBy(edge => edge.OfferedMetadata, StringComparer.Ordinal)
-                .ThenBy(edge => edge.WantedMetadata, StringComparer.Ordinal)
-                .ToList()
+            Edges = SelectLatestEdges(edges)
         };
         ValidateFile(file);
         DateTimeOffset? nextExpirationAtUtc = edges.Count == 0
@@ -163,6 +162,30 @@ public sealed class CurrencyConversionGraphExporter
             file.ExcludedIncoherentCount,
             file.ExcludedManualSkipCount,
             nextExpirationAtUtc);
+    }
+
+    private static List<CurrencyConversionGraphEdgeCapture> SelectLatestEdges(
+        IReadOnlyCollection<CurrencyConversionGraphEdgeCapture> edges)
+    {
+        return edges
+            .GroupBy(edge => new CurrencyPairKey(edge.OfferedMetadata, edge.WantedMetadata))
+            .Select(group => group
+                .OrderByDescending(edge => edge.CapturedAtUtc)
+                .ThenByDescending(edge => edge.CaptureId)
+                .First())
+            .OrderBy(edge => edge.OfferedMetadata, StringComparer.Ordinal)
+            .ThenBy(edge => edge.WantedMetadata, StringComparer.Ordinal)
+            .ToList();
+    }
+
+    private static bool IsCanonicalPair(CurrencyCatalogue catalogue, CurrencyPairKey pair)
+    {
+        return (catalogue.TryGetUniqueByName("Chaos Orb", out var chaos) &&
+                pair.WantedMetadata == chaos!.Metadata &&
+                pair.OfferedMetadata != chaos.Metadata) ||
+            (catalogue.TryGetUniqueByName("Divine Orb", out var divine) &&
+                pair.WantedMetadata == divine!.Metadata &&
+                pair.OfferedMetadata != divine.Metadata);
     }
 
     private static Dictionary<CurrencyPairKey, ScanCaptureReferenceCapture>
@@ -249,16 +272,49 @@ public sealed class CurrencyConversionGraphExporter
         return false;
     }
 
-    private static CurrencyConversionGraphEdgeCapture CreateEdge(
+    private static IEnumerable<CurrencyConversionGraphEdgeCapture> CreateEdges(
         ExchangePairSnapshot snapshot,
         string coherence,
         DateTimeOffset generatedAtUtc)
     {
-        var rate = snapshot.MarketRate!;
+        if ((snapshot.TopImmediateStock?.SelectedPairRate ?? snapshot.MarketRate) is { } immediateRate)
+        {
+            yield return CreateEdge(
+                snapshot,
+                snapshot.OfferedCurrency.Metadata,
+                snapshot.WantedCurrency.Metadata,
+                immediateRate,
+                coherence,
+                "ImmediateBook",
+                generatedAtUtc);
+        }
+
+        if (snapshot.TopCompetingStock?.RawRate is { } competingRate)
+        {
+            yield return CreateEdge(
+                snapshot,
+                snapshot.WantedCurrency.Metadata,
+                snapshot.OfferedCurrency.Metadata,
+                competingRate,
+                coherence,
+                "CompetingBook",
+                generatedAtUtc);
+        }
+    }
+
+    private static CurrencyConversionGraphEdgeCapture CreateEdge(
+        ExchangePairSnapshot snapshot,
+        string offeredMetadata,
+        string wantedMetadata,
+        RationalExchangeRate rate,
+        string coherence,
+        string bookSide,
+        DateTimeOffset generatedAtUtc)
+    {
         return new CurrencyConversionGraphEdgeCapture
         {
-            OfferedMetadata = snapshot.OfferedCurrency.Metadata,
-            WantedMetadata = snapshot.WantedCurrency.Metadata,
+            OfferedMetadata = offeredMetadata,
+            WantedMetadata = wantedMetadata,
             CaptureId = snapshot.CaptureId,
             CapturedAtUtc = snapshot.CapturedAtUtc,
             AgeSecondsAtGeneration = (long)(generatedAtUtc - snapshot.CapturedAtUtc).TotalSeconds,
@@ -267,6 +323,7 @@ public sealed class CurrencyConversionGraphExporter
             ScanSequence = snapshot.ScanSequence,
             Source = snapshot.Source.ToString(),
             Coherence = coherence,
+            BookSide = bookSide,
             RawGet = rate.RawGet,
             RawGive = rate.RawGive,
             GetUnits = rate.GetUnits,
@@ -294,11 +351,7 @@ public sealed class CurrencyConversionGraphExporter
             file.ExcludedNullRateCount < 0 || file.ExcludedUnknownCurrencyCount < 0 ||
             file.ExcludedFutureCount < 0 || file.ExcludedStaleCount < 0 ||
             file.ExcludedIncoherentCount < 0 || file.ExcludedManualSkipCount < 0 ||
-            file.EdgeCount + file.ExcludedNullRateCount +
-                file.ExcludedUnknownCurrencyCount + file.ExcludedFutureCount +
-                file.ExcludedStaleCount + file.ExcludedIncoherentCount +
-                file.ExcludedManualSkipCount !=
-                    file.CurrentLeagueCaptureCount)
+            file.CurrentLeagueCaptureCount < 0)
         {
             throw new InvalidDataException("Conversion graph root metadata is invalid.");
         }
@@ -313,14 +366,13 @@ public sealed class CurrencyConversionGraphExporter
         }
 
         var pairs = new HashSet<CurrencyPairKey>();
-        var captureIds = new HashSet<Guid>();
         foreach (var edge in file.Edges)
         {
             var pair = new CurrencyPairKey(edge.OfferedMetadata, edge.WantedMetadata);
             if (!vertices.ContainsKey(edge.OfferedMetadata) ||
                 !vertices.ContainsKey(edge.WantedMetadata) ||
                 edge.OfferedMetadata == edge.WantedMetadata || !pairs.Add(pair) ||
-                edge.CaptureId == Guid.Empty || !captureIds.Add(edge.CaptureId) ||
+                edge.CaptureId == Guid.Empty ||
                 edge.CapturedAtUtc == default || edge.AgeSecondsAtGeneration < 0 ||
                 edge.CollectorSessionId == Guid.Empty || !edge.ScanId.HasValue ||
                 edge.ScanId.Value == Guid.Empty || edge.ScanSequence is null or <= 0 ||
@@ -329,6 +381,7 @@ public sealed class CurrencyConversionGraphExporter
                 !RationalExchangeRate.TryCreate(edge.RawGet, edge.RawGive, out var rate) ||
                 rate!.GetUnits != edge.GetUnits || rate.GiveUnits != edge.GiveUnits ||
                 rate.WantedPerOffered != edge.WantedPerOffered ||
+                edge.BookSide is not "ImmediateBook" and not "CompetingBook" ||
                 edge.Coherence is not "ActiveDiscoveryProbe" and not "CompletedBoundedScan")
             {
                 throw new InvalidDataException("Conversion graph contains an invalid edge.");
@@ -368,6 +421,7 @@ public sealed class CurrencyConversionGraphEdgeCapture
     public int? ScanSequence { get; set; }
     public string Source { get; set; } = "";
     public string Coherence { get; set; } = "";
+    public string BookSide { get; set; } = "";
     public int RawGet { get; set; }
     public int RawGive { get; set; }
     public int GetUnits { get; set; }

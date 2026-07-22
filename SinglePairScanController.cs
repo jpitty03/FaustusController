@@ -467,7 +467,10 @@ public sealed class SinglePairScanController
             return;
         }
 
-        if (snapshot.MarketRate == null)
+        var immediateRate = snapshot.TopImmediateStock?.SelectedPairRate;
+        var competingRate = snapshot.TopCompetingStock?.RawRate;
+        var observedRate = immediateRate ?? competingRate;
+        if (observedRate == null)
         {
             _readableNoMarketSamples = _lastReadableNoMarketAtUtc != default &&
                 now - _lastReadableNoMarketAtUtc <= MaximumNoMarketSampleGap
@@ -477,27 +480,27 @@ public sealed class SinglePairScanController
             if (_readableNoMarketSamples >= 3 && !_sawPositiveMarketRate && !_rateReadFailed)
             {
                 Cancel(
-                    "No positive market rate was observed in three consecutive readable samples.",
+                    "No immediate or competing market rate was observed in three consecutive readable samples.",
                     SinglePairScanFailureKind.NoMarketRate);
                 return;
             }
 
-            Status = $"No positive market rate: confirming readable sample " +
+            Status = $"No immediate or competing market rate: confirming readable sample " +
                 $"{_readableNoMarketSamples}/3.";
             return;
         }
 
         _sawPositiveMarketRate = true;
 
-        if (snapshot.MarketRate.RawGet == _lastRateGet &&
-            snapshot.MarketRate.RawGive == _lastRateGive)
+        if (observedRate.RawGet == _lastRateGet &&
+            observedRate.RawGive == _lastRateGive)
         {
             _stableRateSamples++;
         }
         else
         {
-            _lastRateGet = snapshot.MarketRate.RawGet;
-            _lastRateGive = snapshot.MarketRate.RawGive;
+            _lastRateGet = observedRate.RawGet;
+            _lastRateGive = observedRate.RawGive;
             _stableRateSamples = 1;
         }
 

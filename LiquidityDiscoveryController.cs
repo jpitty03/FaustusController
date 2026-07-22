@@ -286,10 +286,10 @@ public sealed class LiquidityDiscoveryController
         _reuseOpenPickerForNextPair = false;
         if (State == LiquidityDiscoveryState.AwaitingPersistence)
         {
-            if (_pendingProbe!.Status == CurrencyDiscoveryProbeStatus.Unavailable)
+            if (_pendingProbe!.Status != CurrencyDiscoveryProbeStatus.Failed)
             {
                 Status = "Liquidity discovery cancellation will stop after persisting the " +
-                    $"confirmed unavailable outcome: {reason}";
+                    $"confirmed {_pendingProbe.Status} outcome: {reason}";
                 return;
             }
 

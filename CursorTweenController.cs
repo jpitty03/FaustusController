@@ -19,6 +19,7 @@ public sealed class CursorTweenController
     private const float TargetMovementTolerance = 4;
     private static readonly TimeSpan MinimumDuration = TimeSpan.FromMilliseconds(120);
     private static readonly TimeSpan MaximumDuration = TimeSpan.FromMilliseconds(650);
+    private static readonly TimeSpan ArrivalVerificationTimeout = TimeSpan.FromMilliseconds(500);
 
     private CurrencyIdentity? _targetCurrency;
     private bool _expectedWantedPicker;
@@ -29,6 +30,9 @@ public sealed class CursorTweenController
     private Vector2 _lastCommandedPosition;
     private DateTimeOffset _startedAtUtc;
     private TimeSpan _duration;
+    private bool _awaitingArrival;
+    private bool _arrivalCorrectionSent;
+    private DateTimeOffset _arrivalDeadlineUtc;
     private float _curveDirection = 1;
 
     public CursorTweenState State { get; private set; } = CursorTweenState.Idle;
@@ -58,12 +62,18 @@ public sealed class CursorTweenController
         _targetCurrency = targetCurrency;
         _expectedWantedPicker = expectedWantedPicker;
         _target = target;
+        _awaitingArrival = false;
+        _arrivalCorrectionSent = false;
+        _arrivalDeadlineUtc = default;
         var delta = target - _start;
         var distance = delta.Length();
         if (distance < 1)
         {
-            State = CursorTweenState.Completed;
-            Status = $"Cursor is already over verified {targetCurrency.Name}; no click sent.";
+            _lastCommandedPosition = _start;
+            _awaitingArrival = true;
+            _arrivalDeadlineUtc = DateTimeOffset.UtcNow + ArrivalVerificationTimeout;
+            State = CursorTweenState.Moving;
+            Status = $"Cursor is near verified {targetCurrency.Name}; waiting for later-frame arrival proof.";
             failureReason = string.Empty;
             return true;
         }
@@ -117,6 +127,12 @@ public sealed class CursorTweenController
             return;
         }
 
+        if (_awaitingArrival)
+        {
+            VerifyArrival(gameController, freshTarget);
+            return;
+        }
+
         var currentPosition = Input.MousePositionNum;
         if (Vector2.Distance(currentPosition, _lastCommandedPosition) > ManualInterruptionDistance)
         {
@@ -153,9 +169,57 @@ public sealed class CursorTweenController
 
         if (progress >= 1)
         {
-            State = CursorTweenState.Completed;
-            Status = $"Cursor tween reached verified {_targetCurrency!.Name}; no click sent.";
+            _awaitingArrival = true;
+            _arrivalCorrectionSent = false;
+            _arrivalDeadlineUtc = DateTimeOffset.UtcNow + ArrivalVerificationTimeout;
+            Status = $"Final cursor command sent for verified {_targetCurrency!.Name}; waiting for later-frame arrival proof.";
         }
+    }
+
+    private void VerifyArrival(
+        GameController gameController,
+        CurrencyPickerOptionTarget freshTarget)
+    {
+        var cursorPosition = Input.MousePositionNum;
+        if (DateTimeOffset.UtcNow >= _arrivalDeadlineUtc)
+        {
+            Cancel(
+                $"Cursor tween cancelled: actual cursor {cursorPosition.X:0},{cursorPosition.Y:0} " +
+                $"did not settle inside verified {_targetCurrency!.Name}; no click sent.");
+            return;
+        }
+
+        if (freshTarget.Contains(cursorPosition, inset: 2))
+        {
+            State = CursorTweenState.Completed;
+            Status = $"Cursor arrival verified inside {_targetCurrency!.Name} on a later frame; no click sent.";
+            return;
+        }
+
+        if (!_arrivalCorrectionSent)
+        {
+            if (!gameController.Window.IsForeground())
+            {
+                Cancel("Cursor tween cancelled: Path of Exile lost foreground before arrival correction.");
+                return;
+            }
+
+            try
+            {
+                Input.SetCursorPos(freshTarget.Center);
+                _lastCommandedPosition = freshTarget.Center;
+                _arrivalCorrectionSent = true;
+                Status = $"Sent one pre-click corrective cursor command for {_targetCurrency!.Name}; waiting for proof.";
+            }
+            catch (Exception exception)
+            {
+                Cancel($"Cursor arrival correction failed: {exception.Message}");
+            }
+
+            return;
+        }
+
+        Status = $"Waiting for actual cursor to settle inside verified {_targetCurrency!.Name}; no click sent.";
     }
 
     public void Cancel(string reason)

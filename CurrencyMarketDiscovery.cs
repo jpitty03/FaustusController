@@ -57,31 +57,6 @@ public sealed class ActiveMarketDiscoveryExporter
         var outcomesByPair = (probeOutcomes ?? [])
             .Where(outcome => string.Equals(outcome.League, league, StringComparison.Ordinal))
             .ToDictionary(outcome => outcome.Pair);
-        var phaseOneComplete = phaseOnePairs.All(pair =>
-            outcomesByPair.TryGetValue(pair, out var outcome) &&
-            outcome.Status is CurrencyDiscoveryProbeStatus.Active or
-                CurrencyDiscoveryProbeStatus.NoMarketRate or
-                CurrencyDiscoveryProbeStatus.Unavailable);
-        var eligibleReversePairs = phaseOneComplete
-            ? phaseOnePairs
-                .Where(pair =>
-                    outcomesByPair.TryGetValue(pair, out var outcome) &&
-                        outcome.Status == CurrencyDiscoveryProbeStatus.Active ||
-                    includedCurrencyMetadata != null &&
-                        includedCurrencyMetadata.Contains(pair.OfferedMetadata) ||
-                    outcomesByPair.TryGetValue(
-                        new CurrencyPairKey(
-                            pair.WantedMetadata,
-                            pair.OfferedMetadata),
-                        out var reverseOutcome) &&
-                        reverseOutcome.Status == CurrencyDiscoveryProbeStatus.Active)
-                .Select(pair => new CurrencyPairKey(
-                    pair.WantedMetadata,
-                    pair.OfferedMetadata))
-                .Where(pair => !phaseOnePairs.Contains(pair))
-                .ToHashSet()
-            : [];
-
         var generatedAtUtc = DateTimeOffset.UtcNow;
         var oldestFreshCapture = generatedAtUtc - maximumQuoteAge;
         var negativeByPair = (probeOutcomes ?? [])
@@ -106,29 +81,10 @@ public sealed class ActiveMarketDiscoveryExporter
         foreach (var (metadata, currency) in currenciesByMetadata)
         {
             currency.Currency = CreateCurrency(catalogueByMetadata[metadata]);
-            if (metadata == chaosCurrency.Metadata)
-            {
-                currency.ChaosMarket = null;
-            }
-
-            if (metadata == divineCurrency.Metadata)
-            {
-                currency.DivineMarket = null;
-            }
-
-            if (!eligibleReversePairs.Contains(new CurrencyPairKey(
-                chaosCurrency.Metadata,
-                metadata)))
-            {
-                currency.ChaosBuyMarket = null;
-            }
-
-            if (!eligibleReversePairs.Contains(new CurrencyPairKey(
-                divineCurrency.Metadata,
-                metadata)))
-            {
-                currency.DivineBuyMarket = null;
-            }
+            currency.ChaosMarket = null;
+            currency.DivineMarket = null;
+            currency.ChaosBuyMarket = null;
+            currency.DivineBuyMarket = null;
 
             RefreshAge(currency.ChaosMarket, generatedAtUtc, oldestFreshCapture);
             RefreshAge(currency.DivineMarket, generatedAtUtc, oldestFreshCapture);
@@ -144,11 +100,10 @@ public sealed class ActiveMarketDiscoveryExporter
                 !catalogueByMetadata.ContainsKey(outcome.OfferedCurrency.Metadata) ||
                 !catalogueByMetadata.ContainsKey(outcome.WantedCurrency.Metadata) ||
                 outcome.Pair.OfferedMetadata == outcome.Pair.WantedMetadata ||
-                !TryResolveDirection(
+                !TryResolveCanonicalDirection(
                     outcome.Pair,
                     chaosCurrency.Metadata,
                     divineCurrency.Metadata,
-                    eligibleReversePairs,
                     out var currencyMetadata,
                     out var direction) ||
                 !currenciesByMetadata.TryGetValue(
@@ -163,15 +118,14 @@ public sealed class ActiveMarketDiscoveryExporter
 
         var activePairs = snapshots
             .Where(snapshot => string.Equals(snapshot.League, league, StringComparison.Ordinal) &&
-                snapshot.MarketRate != null &&
                 catalogueByMetadata.ContainsKey(snapshot.OfferedCurrency.Metadata) &&
                 catalogueByMetadata.ContainsKey(snapshot.WantedCurrency.Metadata) &&
                 snapshot.OfferedCurrency.Metadata != snapshot.WantedCurrency.Metadata &&
-                TryResolveDirection(
+                phaseOnePairs.Contains(snapshot.Pair) &&
+                TryResolveCanonicalDirection(
                     snapshot.Pair,
                     chaosCurrency.Metadata,
                     divineCurrency.Metadata,
-                    eligibleReversePairs,
                     out _,
                     out _) &&
                 (!negativeByPair.TryGetValue(snapshot.Pair, out var negative) ||
@@ -185,11 +139,10 @@ public sealed class ActiveMarketDiscoveryExporter
 
         foreach (var snapshot in activePairs)
         {
-            _ = TryResolveDirection(
+            _ = TryResolveCanonicalDirection(
                 snapshot.Pair,
                 chaosCurrency.Metadata,
                 divineCurrency.Metadata,
-                eligibleReversePairs,
                 out var currencyMetadata,
                 out var direction);
             if (!currenciesByMetadata.TryGetValue(
@@ -203,8 +156,25 @@ public sealed class ActiveMarketDiscoveryExporter
                 currenciesByMetadata[currencyMetadata] = currency;
             }
 
-            var market = CreateMarket(snapshot, generatedAtUtc, oldestFreshCapture)!;
-            SetMarketIfNewer(currency, direction, market);
+            var directMarket = CreateMarket(
+                snapshot,
+                snapshot.TopImmediateStock?.SelectedPairRate ?? snapshot.MarketRate,
+                generatedAtUtc,
+                oldestFreshCapture);
+            if (directMarket != null)
+            {
+                SetMarketIfNewer(currency, direction, directMarket);
+            }
+
+            var reverseMarket = CreateMarket(
+                snapshot,
+                snapshot.TopCompetingStock?.RawRate,
+                generatedAtUtc,
+                oldestFreshCapture);
+            if (reverseMarket != null)
+            {
+                SetMarketIfNewer(currency, ReverseDirection(direction), reverseMarket);
+            }
         }
 
         var currencies = currenciesByMetadata.Values
@@ -240,7 +210,7 @@ public sealed class ActiveMarketDiscoveryExporter
             League = league,
             MaximumQuoteAgeMinutes = (int)Math.Ceiling(maximumQuoteAge.TotalMinutes),
             CatalogueCurrencyCount = catalogue.Items.Count,
-            EligibleProbePairCount = phaseOnePairs.Count + eligibleReversePairs.Count,
+            EligibleProbePairCount = phaseOnePairs.Count,
             ObservedActivePairCount = observedActivePairCount,
             ActiveCurrencyCount = currencies.Count,
             Currencies = currencies
@@ -267,11 +237,10 @@ public sealed class ActiveMarketDiscoveryExporter
             export.ActiveCurrencyCount);
     }
 
-    private static bool TryResolveDirection(
+    private static bool TryResolveCanonicalDirection(
         CurrencyPairKey pair,
         string chaosMetadata,
         string divineMetadata,
-        IReadOnlySet<CurrencyPairKey> eligibleReversePairs,
         out string currencyMetadata,
         out MarketDirection direction)
     {
@@ -289,23 +258,19 @@ public sealed class ActiveMarketDiscoveryExporter
             return true;
         }
 
-        if (eligibleReversePairs.Contains(pair) && pair.OfferedMetadata == chaosMetadata)
-        {
-            currencyMetadata = pair.WantedMetadata;
-            direction = MarketDirection.BuyWithChaos;
-            return true;
-        }
-
-        if (eligibleReversePairs.Contains(pair) && pair.OfferedMetadata == divineMetadata)
-        {
-            currencyMetadata = pair.WantedMetadata;
-            direction = MarketDirection.BuyWithDivine;
-            return true;
-        }
-
         currencyMetadata = "";
         direction = default;
         return false;
+    }
+
+    private static MarketDirection ReverseDirection(MarketDirection direction)
+    {
+        return direction switch
+        {
+            MarketDirection.SellForChaos => MarketDirection.BuyWithChaos,
+            MarketDirection.SellForDivine => MarketDirection.BuyWithDivine,
+            _ => throw new InvalidDataException("Only canonical sell directions can be reversed.")
+        };
     }
 
     private static void ClearMarketIfOlder(
@@ -488,10 +453,11 @@ public sealed class ActiveMarketDiscoveryExporter
 
     private static ActiveMarketQuoteCapture? CreateMarket(
         ExchangePairSnapshot? snapshot,
+        RationalExchangeRate? rate,
         DateTimeOffset generatedAtUtc,
         DateTimeOffset oldestFreshCapture)
     {
-        if (snapshot?.MarketRate == null)
+        if (snapshot == null || rate == null)
         {
             return null;
         }
@@ -506,11 +472,11 @@ public sealed class ActiveMarketDiscoveryExporter
                 (long)(generatedAtUtc - snapshot.CapturedAtUtc).TotalSeconds),
             FreshAtGeneration = snapshot.CapturedAtUtc >= oldestFreshCapture &&
                 snapshot.CapturedAtUtc <= generatedAtUtc,
-            RawGet = snapshot.MarketRate.RawGet,
-            RawGive = snapshot.MarketRate.RawGive,
-            GetUnits = snapshot.MarketRate.GetUnits,
-            GiveUnits = snapshot.MarketRate.GiveUnits,
-            WantedPerOffered = snapshot.MarketRate.WantedPerOffered,
+            RawGet = rate.RawGet,
+            RawGive = rate.RawGive,
+            GetUnits = rate.GetUnits,
+            GiveUnits = rate.GiveUnits,
+            WantedPerOffered = rate.WantedPerOffered,
             ImmediateStockRows = snapshot.WantedItemStock.Count,
             CompetingStockRows = snapshot.OfferedItemStock.Count,
             ImmediateListedCount = snapshot.WantedItemStock.Sum(row => (long)row.ListedCount),

@@ -9,9 +9,9 @@ Create a new ExileAPI plugin, tentatively named `FaustusController`, with two re
 
 The optimization target is to accumulate Chaos Orbs or Divine Orbs through whole-unit conversions while minimizing transaction costs. Use `1 Divine Orb = 200 Chaos Orbs` as the configurable valuation baseline, not as a replacement for observed market quotes.
 
-## Current Increment: Full Discovery and Active Refresh
+## Current Increment: Discovery/Refresh Separation
 
-One F2 press now processes every unresolved pair in the current discovery phase rather than stopping at an arbitrary batch size. Initial discovery covers every non-skipped catalogue currency against Chaos and Divine; a later run completes candidate-only reverse discovery. Once no discovery pair is unresolved, each F2 press refreshes only current `Active` pairs plus manual `ForceInclude` currencies. League-scoped manual overrides can keep selected currencies in refresh or remove them from discovery, active-market output, and conversion-graph edges.
+F2 is canonical discovery-only: one press processes every unresolved `Item -> Chaos/Divine` pair, then stops permanently once discovery is complete. Insert is a separate disabled-by-default automation that consumes a materialized canonical refresh plan containing only current `Active` pairs plus manual `ForceInclude` pairs, minus `ForceSkip`. Each canonical panel capture can emit two executable directions: the direct available-book edge and the reverse competing-book edge.
 
 Current source layout:
 
@@ -25,6 +25,7 @@ Current source layout:
 | `CurrencyConversionGraph.cs` | Full-catalogue vertices, coherent fresh directed exact-rate edges, exclusion diagnostics, and atomic JSON export |
 | `CurrencyDiscoveryProbeStore.cs` | Latest per-pair discovery outcomes, validation, counts, and atomic resumable registry |
 | `CurrencyDiscoveryOverrides.cs` | League-scoped manual force-include/force-skip identities and atomic default-file creation |
+| `ActiveRefreshPlan.cs` | Exact directed Insert workload, Active/ForceInclude reasons, readiness validation, and atomic JSON export |
 | `LiquidityDiscoveryController.cs` | Cancellable full-phase F2 orchestration that continues past confirmed no-market pairs |
 | `CurrencyPickerInspector.cs` | Read-only visible picker-option identity, owned amount, and center-coordinate inspection |
 | `CurrencySearchQueryController.cs` | Foreground-gated Ctrl+F, Ctrl+A, token entry, timeout, cancellation, and exact metadata verification |
@@ -66,9 +67,9 @@ Phase 1 sell-side probes:
   X -> Chaos
   X -> Divine
 
-Phase 2 reverse probes for phase-1 candidates only:
-  Chaos -> X
-  Divine -> X
+Reverse executable evidence is derived from the competing book shown by the canonical phase-1 panel:
+  Chaos -> X from X -> Chaos competing rows
+  Divine -> X from X -> Divine competing rows
 ```
 
 Phase 1 is already represented by `CurrencyScanPlan.InitialCollectionSteps` and contains `2N - 2` unique pairs. A positive exact market rate proves that the directed pair was actively listed at `CapturedAtUtc`. Absence from successful captures means only `untested or not observed`; it must not be labeled inactive, Chaos-only, or Divine-only until an explicit negative probe completes. This distinction matters for high-value markets such as Mirror of Kalandra, which may be actively quoted against Divine but not Chaos.
@@ -85,7 +86,15 @@ The compact registry retains the newest validated positive observation per curre
 
 Do not call this file a popularity ranking yet. The public panel exposes current quote and order-book evidence, not executed trade volume. `ListedCount` may help rank apparent depth but is not validated fillable volume. A later classifier may use repeated probe success, freshness, two-sided depth, spread, and explicit negative outcomes to produce categories such as `ChaosOnly`, `DivineOnly`, `Both`, and `Inactive`.
 
-F2 implements full initial discovery, candidate-only reverse discovery, and active refresh with `AllowLiquidityDiscoveryAutomation` disabled by default. There is no pair-count cap: one run processes the complete current phase, but remains explicitly cancellable with F2 at any time. It uses the same calibrated picker, exact metadata query, cursor tween, guarded click, and foreground/cancellation rules as F3. Reverse discovery remains dormant while any non-skipped phase-one outcome is missing or `Failed`. Once phase one is complete, the eligible set expands by the distinct inverse of each phase-one `Active` or manually included pair; inverses already present in phase one are not duplicated. After all eligible pairs are terminal, later runs refresh only pairs whose latest outcome is `Active` or whose non-base currency is manually included.
+F2 implements full canonical `Item -> Chaos/Divine` discovery with `AllowLiquidityDiscoveryAutomation` disabled by default. There is no pair-count cap: one run processes the complete current phase, but remains explicitly cancellable with F2 at any time. It uses the same calibrated picker, exact metadata query, cursor tween, guarded click, and foreground/cancellation rules as F3. Physical reverse `Chaos/Divine -> Item` probes are not run; competing rows in the canonical panel provide the reverse executable evidence. When all eligible canonical discovery outcomes are terminal, F2 reports completion and sends no input.
+
+Insert runs directed active refresh with the separate `AllowActiveRefreshAutomation` master toggle, disabled by default, plus the same four lower-level picker/query/movement/click permissions. Before any Insert input, atomically write:
+
+```text
+<ConfigDirectory>/FaustusController_refresh-plan-<sanitized-league>.json
+```
+
+The plan is `Ready: false` with zero pairs while F2 discovery is incomplete. Once ready, it contains exactly the canonical panel pairs Insert will process, sorted deterministically, with offered/wanted identities, canonical direction, `CanonicalActive` or `ForceInclude` reason, and latest outcome/capture provenance. Active-market and graph exports derive reverse `BuyWithChaos`/`BuyWithDivine` evidence from `OfferedItemStock.RawRate` in the same capture. Multiple visible picker results are acceptable because exact metadata remains the click authority. Insert uses the existing F2 verified controller and can be cancelled with Insert without retry. An automation failure during refresh stops the run but preserves the pair's prior terminal discovery outcome, so refresh failures do not reopen F2 discovery or erase an active listing; positive/no-market/unavailable observations still update normally.
 
 Create and manually edit the league-scoped override file:
 
@@ -107,7 +116,7 @@ Create and manually edit the league-scoped override file:
 }
 ```
 
-Metadata is authoritative; `Name` is for readability. Entries must exist in the live catalogue, must be unique, and cannot appear in both lists. Chaos Orb and Divine Orb cannot be overridden. F2 reloads this file whenever a new run starts. `ForceInclude` keeps both base-market directions eligible for discovery/refresh even after no-market or unavailable outcomes. `ForceSkip` removes that currency from pending discovery and refresh, suppresses it from active-market output, and excludes its positive captures from graph edges without deleting durable captures or probe history.
+Metadata is authoritative; `Name` is for readability. Entries must exist in the live catalogue, must be unique, and cannot appear in both lists. Chaos Orb and Divine Orb cannot be overridden. F2 and Insert reload this file whenever a new run starts. `ForceInclude` keeps both base-market directions eligible for discovery/refresh even after no-market or unavailable outcomes. `ForceSkip` removes that currency from pending discovery and refresh, suppresses it from active-market output, and excludes its positive captures from graph edges without deleting durable captures or probe history.
 
 Persist outcomes atomically to:
 
@@ -181,8 +190,12 @@ During every tween tick:
 1. Revalidate foreground, panel, picker, picker side, exact metadata, visibility, and picker bounds.
 2. Cancel if the fresh target center moved more than 4 pixels from the verified endpoint.
 3. Cancel if the actual cursor differs by more than 25 pixels from the last commanded position, treating that as manual user interruption.
-4. Calculate one eased BÃ©zier position and call `Input.SetCursorPos` once.
-5. Never retain an `Element` or send a mouse button event.
+4. Calculate one eased Bézier position and call `Input.SetCursorPos` once.
+5. After the final command, remain in the moving state until a later frame proves that `Input.MousePositionNum` is inside the freshly re-read exact option bounds with the same two-pixel inset used by click verification.
+6. If the later-frame cursor is still outside, allow exactly one pre-click corrective `SetCursorPos` to the fresh center, then wait up to 500 ms for proof; never retry a click.
+7. Ignore manual-interruption distance only during this bounded arrival-verification window so an asynchronous stale cursor sample is not misclassified as user movement.
+8. Fault without clicking if arrival proof times out, foreground/context changes, or the target moves.
+9. Never retain an `Element` or send a mouse button event.
 
 F10 has `IgnoreFocusedInput = true` because the picker search remains focused. Starting a new preview/query, disabling mouse movement, changing areas, or losing context cancels an active tween.
 
@@ -635,45 +648,54 @@ The active-market test fails if stale/foreign-league captures are mislabeled fre
 6. For a pair with a positive stable rate, confirm an `Active` outcome references the exact persisted capture ID before the next probe starts.
 7. For a verified pair with no positive rate, confirm three consecutive readable null samples complete in about 700 ms, `NoMarketRate` persists with no capture ID, and F2 advances after its separate 500 ms between-pair delay.
 8. Cancel the long run with F2. Confirm the current pair persists `Failed`, input stops without retry, and the next F2 press resumes all remaining phase-one work.
-9. After initial discovery completes, press F2 and confirm status says `Active-candidate reverse discovery`; only inverses of active or force-included candidates are planned.
-10. After reverse discovery completes, press F2 and confirm status says `Active listing refresh`; every current active pair is planned once, while no-market/unavailable pairs are omitted unless force-included.
-11. Force a refreshed active pair to return no market. Confirm its outcome becomes `NoMarketRate`, it is removed from later active-refresh runs, and its stale graph edge expires normally.
-12. During separate runs, disable a permission, move the mouse, close the panel, change area, and lose foreground. Confirm the current pair receives a persisted `Failed` reason, no input retries, and no false `NoMarketRate` result.
-13. Force a positive quote to remain unstable until timeout. Confirm the outcome is `Failed`, includes a reason, and stops the run rather than classifying the pair inactive.
-14. Confirm a newer explicit `NoMarketRate` outcome removes older positive evidence for that side from `active-markets.json`; then capture a newer positive rate and confirm it restores `Active` evidence.
-15. Probe a stale catalogue entry whose query produces no exact metadata match, both with zero results and with unrelated visible results. Confirm no Escape is sent, the picker remains open, the outcome persists as `Unavailable`, `UnavailableCount` increments, and F2 starts the next query in the same picker through Ctrl+F/Ctrl+A.
-16. Confirm input, context, or picker-inspection failures still persist `Failed` and stop rather than being classified as unavailable.
-17. End a phase run on an unavailable item, press F2 again with the picker still open, and confirm the new run adopts that picker and replaces its query for the next unresolved probe.
-18. Probe `Honoured Tattoo of the Pa`. Confirm the initial broad query may be rejected for out-of-bounds target geometry before movement, then exactly one quoted `"honoured tattoo of the pa"` query replaces it. Confirm a valid exact row proceeds normally; if the quoted row is absent or still out of bounds, confirm `Unavailable` persists and F2 reuses the open picker for the next probe.
-19. Probe `The Pack Leader`. Confirm `pack` may show multiple options, but an exact visible metadata row proceeds directly to verified movement and selection without quoting merely because other rows exist.
-20. Probe Divine Orb and confirm `divine orb` may show several listings while the exact Divine Orb row is selected directly. Confirm quotes are used only if the exact row is absent or outside the usable picker rectangle.
-21. Confirm F3-F12 manual/automated actions are blocked while F2 is active, including F7/F12 rather than cancelling it, and F2 cannot start while F3/F4 is active.
+9. After initial discovery completes, press F2 and confirm it reports `Full discovery is complete. Use Insert for directed active refresh.` without sending input.
+11. During separate discovery runs, disable a permission, move the mouse, close the panel, change area, and lose foreground. Confirm the current pair receives a persisted `Failed` reason, no input retries, and no false `NoMarketRate` result.
+12. Force a positive quote to remain unstable until timeout. Confirm the outcome is `Failed`, includes a reason, and stops the run rather than classifying the pair inactive.
+13. Confirm a newer explicit `NoMarketRate` outcome removes older positive evidence for that side from `active-markets.json`; then capture a newer positive rate and confirm it restores `Active` evidence.
+14. Probe a stale catalogue entry whose query produces no exact metadata match, both with zero results and with unrelated visible results. Confirm no Escape is sent, the picker remains open, the outcome persists as `Unavailable`, `UnavailableCount` increments, and F2 starts the next query in the same picker through Ctrl+F/Ctrl+A.
+15. Confirm input, context, or picker-inspection failures still persist `Failed` and stop rather than being classified as unavailable.
+16. End a phase run on an unavailable item, press F2 again with the picker still open, and confirm the new run adopts that picker and replaces its query for the next unresolved probe.
+17. Probe `Honoured Tattoo of the Pa`. Confirm the initial broad query may be rejected for out-of-bounds target geometry before movement, then exactly one quoted `"honoured tattoo of the pa"` query replaces it. Confirm a valid exact row proceeds normally; if the quoted row is absent or still out of bounds, confirm `Unavailable` persists and F2 reuses the open picker for the next probe.
+18. Probe `The Pack Leader`. Confirm `pack` may show multiple options, but an exact visible metadata row proceeds directly to verified movement and selection without quoting merely because other rows exist.
+19. Probe Divine Orb and confirm `divine orb` may show several listings while the exact Divine Orb row is selected directly. Confirm quotes are used only if the exact row is absent or outside the usable picker rectangle.
+20. Confirm F3-F12 and Insert are blocked while F2 is active, and F2 cannot start while F3/F4 is active.
 
-The liquidity-discovery test fails if untested and no-market are conflated, F2 stops at an arbitrary pair cap, active refresh includes nonactive non-overridden pairs, F2 advances before all required files persist, a context failure becomes negative evidence, or input retries after cancellation/failure.
+The liquidity-discovery test fails if untested and no-market are conflated, F2 stops at an arbitrary pair cap, F2 performs active refresh after discovery completes, F2 advances before all required files persist, a context failure becomes negative evidence, or input retries after cancellation/failure.
+
+### Directed Active Refresh Test
+
+1. Before F2 discovery completes, confirm `FaustusController_refresh-plan-Standard.json` has `Ready: false`, `PairCount: 0`, and Insert sends no input.
+2. Complete discovery and confirm the plan becomes ready and contains exactly each current `Active` canonical panel pair plus each `ForceInclude` canonical pair, minus `ForceSkip`.
+3. Confirm every plan pair records offered/wanted metadata, canonical direction, reason, and latest outcome/capture linkage; no physical reverse pair is planned.
+4. Leave `AllowActiveRefreshAutomation` disabled and press Insert. Confirm no input occurs.
+5. Enable it plus the four lower-level permissions and press Insert. Confirm the exact plan is persisted before input and status says `Directed active listing refresh`.
+6. Confirm every planned canonical pair is processed once. A positive result updates its capture/outcome and can update both direct and competing-book graph directions; `NoMarketRate` or `Unavailable` removes it from the next plan unless force-included.
+7. Cause an automation/context failure. Confirm Insert stops without retry, preserves the prior terminal discovery outcome, and does not reopen F2 discovery.
+8. Press Insert during a run to cancel. Confirm the current operation stops without retry and the prior terminal outcome remains.
+9. Confirm the plan file remains frozen to the run's initial workload while Insert is active, then regenerates after terminal completion/failure.
+
+The active-refresh test fails if Insert runs before discovery completion or plan persistence, processes nonactive non-overridden canonical pairs, plans physical reverse pairs, mutates pair direction, overwrites a terminal outcome with an automation failure, or retries game input.
 
 ### Discovery Override Test
 
-1. Copy an exact non-base metadata/name object from the catalogue or active-market file into `ForceSkip`, then press F2 to reload overrides.
+1. Copy an exact non-base metadata/name object from the catalogue or active-market file into `ForceSkip`, then press F2 or Insert to reload overrides.
 2. Confirm all directed pairs involving that currency are removed from pending discovery and active refresh.
 3. Confirm the currency disappears from `FaustusController_active-markets.json` and its positive graph edges move to `ExcludedManualSkipCount`; source captures and probe outcomes remain intact.
-4. Move the same entry to `ForceInclude`, press F2, and confirm both Chaos/Divine phase-one pairs and eligible reverse pairs remain scheduled even after no-market/unavailable outcomes.
-5. Remove the override and confirm normal outcome-driven active refresh resumes.
-6. Confirm unknown metadata, duplicate entries, overlap between lists, league mismatch, or Chaos/Divine entries reject the override file and block new F2 input without changing durable captures.
+4. Move the same entry to `ForceInclude`, press F2 or Insert to reload overrides, and confirm both canonical Chaos/Divine discovery directions remain eligible and appear in the Insert plan even after no-market/unavailable outcomes.
+5. Remove the override and confirm the next Insert plan returns to outcome-driven active pairs only.
+6. Confirm unknown metadata, duplicate entries, overlap between lists, league mismatch, or Chaos/Divine entries reject the override file and block new F2/Insert input without changing durable captures.
 
 The override test fails if names replace metadata identity, skipped currencies remain graph edges, included currencies disappear after a negative outcome, invalid overrides generate input, or editing overrides deletes observation history.
 
-### Reverse Discovery Test
+### Canonical Two-Sided Book Test
 
-1. Before phase one is complete, confirm every F2 candidate still has Chaos or Divine as the wanted currency; no `base -> X` reverse probe may start early.
-2. On a copied synthetic/controlled registry, mark every phase-one pair resolved and leave two currencies `Active`: one against Chaos and one against Divine.
-3. Start F2 and confirm only `Chaos -> first currency` and `Divine -> second currency` become reverse candidates; phase-one `NoMarketRate` currencies receive no reverse probe.
-4. Confirm an active reverse Chaos probe writes `ChaosBuyMarket` and adds `BuyWithChaos` to `ObservedDirections` without replacing `ChaosMarket` sell evidence.
-5. Confirm an active reverse Divine probe writes `DivineBuyMarket` and `BuyWithDivine` independently.
-6. Confirm a reverse `NoMarketRate` outcome removes only the corresponding buy-side evidence and does not remove sell-side evidence.
-7. Confirm Chaos/Divine cross-pairs already present in phase one are not scheduled or counted twice.
-8. Confirm `EligibleProbePairCount` remains 2202 until phase one completes, then increases only by the distinct active-candidate reverse count.
+1. Probe `Crimson Oil -> Chaos Orb` and confirm `WantedItemStock` creates `SellForChaos` evidence while `OfferedItemStock.RawRate` creates `BuyWithChaos` evidence from the same capture.
+2. Confirm no F2 or Insert step physically selects `Chaos Orb -> Crimson Oil` for that reverse direction.
+3. Confirm a capture with only competing rows is `Active`, persists a snapshot, and emits only the reverse executable direction.
+4. Confirm a capture with neither available nor competing rows becomes `NoMarketRate`.
+5. Confirm graph edges from the two books share capture ID/timestamp/coherence but have distinct `BookSide` values.
 
-The reverse-discovery test fails if phase two starts early, inactive candidates are reverse-probed, buy and sell directions overwrite one another, base cross-pairs duplicate, or reverse evidence lacks exact capture linkage.
+The canonical two-sided test fails if reverse evidence is inferred by reciprocal math, physical reverse probes are planned, competing-book rows are ignored, or direct/reverse book sides overwrite one another.
 
 ### Conversion Graph
 
@@ -700,7 +722,7 @@ The root records current-league capture count and mutually exclusive exclusions 
 
 1. Reload the plugin and confirm `FaustusController_conversion-graph.json` is created after the live catalogue and current league become available.
 2. Confirm `VertexCount` and `Vertices.Count` equal the live catalogue count, with unique metadata identities.
-3. Confirm every edge direction equals its source snapshot direction and no reverse edge exists unless separately captured and coherent.
+3. Confirm every edge direction comes from either the immediate book in the source snapshot direction or the competing book in the opposite direction; no reciprocal-only edge is inferred.
 4. Confirm every edge has positive exact raw/reduced rates and references the matching latest capture ID.
 5. Confirm an F2 edge matches an `Active` outcome by pair, capture ID, run ID, sequence, and timestamp.
 6. Confirm an F3 edge appears only through `LatestCompletedBoundedScan` and references that exact pair/capture/sequence; starting a newer scan must not erase still-current completed edges.
@@ -721,9 +743,9 @@ Keep each stock row's raw ratio as well as its normalized selected-pair comparis
 3. Completed: add a cancelable bounded scanner that selects by `ItemType.Metadata`, waits for stable rates, persists, then advances.
 4. Completed: derive a compact active-market evidence list from successful `currency -> Chaos` and `currency -> Divine` captures.
 5. Completed: persist latest `Active`/`NoMarketRate`/`Unavailable`/`Failed` outcomes and resume F2 discovery past confirmed no-market or unavailable pairs.
-6. Completed: after phase one completes, reverse-probe only active candidates and preserve independent buy/sell direction evidence.
+6. Completed: derive reverse executable evidence from competing-book rows instead of physical reverse probes.
 7. Completed: build a graph where currencies are vertices and only current, coherent, fresh active captures become directed edges.
-8. Current: run complete discovery phases, refresh active listings, and apply league-scoped manual include/skip overrides.
+8. Completed: separate F2 discovery from Insert directed active refresh, materialize the exact refresh plan, and apply league-scoped manual include/skip overrides.
 9. Next: add balances, stock/liquidity limits, gold costs, and whole-unit remainders to route simulation.
 10. Add bounded path search with cycle prevention and configurable maximum hops.
 11. Add dry-run route display before any order placement automation.

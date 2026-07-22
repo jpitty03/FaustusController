@@ -109,7 +109,9 @@ public sealed class VerifiedOptionSelectionController
         if (!target.Contains(cursorPosition, inset: 2))
         {
             return FailStart(
-                "Click blocked: the cursor is not inside the verified option.",
+                $"Click blocked: cursor {cursorPosition.X:0},{cursorPosition.Y:0} is outside " +
+                    $"verified option center {target.Center.X:0},{target.Center.Y:0} " +
+                    $"size {target.Size.X:0}x{target.Size.Y:0}.",
                 out failureReason);
         }
 

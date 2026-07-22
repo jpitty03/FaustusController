@@ -15,6 +15,7 @@ public sealed class FaustusControllerSettings : ISettings
     public ToggleNode AllowSinglePairAutomation { get; set; } = new(false);
     public ToggleNode AllowBoundedScanAutomation { get; set; } = new(false);
     public ToggleNode AllowLiquidityDiscoveryAutomation { get; set; } = new(false);
+    public ToggleNode AllowActiveRefreshAutomation { get; set; } = new(false);
     public RangeNode<int> PairsPerBoundedScan { get; set; } = new(2, 1, 10);
     public RangeNode<int> MaximumQuoteAgeMinutes { get; set; } = new(15, 1, 1440);
     public RangeNode<int> CursorTweenSpeed { get; set; } = new(1600, 400, 4000);
@@ -23,6 +24,10 @@ public sealed class FaustusControllerSettings : ISettings
         IgnoreFocusedInput = true
     };
     public HotkeyNodeV2 RunLiquidityDiscoveryAutomation { get; set; } = new(Keys.F2)
+    {
+        IgnoreFocusedInput = true
+    };
+    public HotkeyNodeV2 RunActiveRefreshAutomation { get; set; } = new(Keys.Insert)
     {
         IgnoreFocusedInput = true
     };
