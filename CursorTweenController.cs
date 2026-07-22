@@ -13,6 +13,8 @@ public enum CursorTweenState
 
 public sealed class CursorTweenController
 {
+    private const string TargetOutsidePickerFailure =
+        "Cursor tween cancelled: target center is outside the picker rectangle.";
     private const float ManualInterruptionDistance = 25;
     private const float TargetMovementTolerance = 4;
     private static readonly TimeSpan MinimumDuration = TimeSpan.FromMilliseconds(120);
@@ -35,6 +37,8 @@ public sealed class CursorTweenController
     public CurrencyIdentity? TargetCurrency => _targetCurrency;
     public bool ExpectedWantedPicker => _expectedWantedPicker;
     public Vector2 TargetPosition => _target;
+    public bool FailedBecauseTargetIsOutsidePicker =>
+        State == CursorTweenState.Faulted && Status == TargetOutsidePickerFailure;
 
     public bool Start(
         CurrencyIdentity targetCurrency,
@@ -211,7 +215,7 @@ public sealed class CursorTweenController
             target.Center.Y > pickerRectangle.Y + pickerRectangle.Height)
         {
             target = null;
-            failureReason = "Cursor tween cancelled: target center is outside the picker rectangle.";
+            failureReason = TargetOutsidePickerFailure;
             return false;
         }
 

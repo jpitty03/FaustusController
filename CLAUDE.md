@@ -9,18 +9,23 @@ Create a new ExileAPI plugin, tentatively named `FaustusController`, with two re
 
 The optimization target is to accumulate Chaos Orbs or Divine Orbs through whole-unit conversions while minimizing transaction costs. Use `1 Divine Orb = 200 Chaos Orbs` as the configurable valuation baseline, not as a replacement for observed market quotes.
 
-## Current Increment: Bounded Multi-Pair Capture
+## Current Increment: Full Discovery and Active Refresh
 
-F3 runs a bounded batch of 1-10 unique directed pairs from the initial `currency -> Chaos` and `currency -> Divine` collection scope. Every pair delegates to the verified F4 one-pair workflow, must produce a fresh stable-rate snapshot, and must persist that snapshot before the batch advances. Pressing F3 again cancels the batch. The implementation deliberately stops before full-plan scanning and path optimization. F4 still runs exactly one current F7 preview pair, and F5-F12 retain the individually testable lower-level operations.
+One F2 press now processes every unresolved pair in the current discovery phase rather than stopping at an arbitrary batch size. Initial discovery covers every non-skipped catalogue currency against Chaos and Divine; a later run completes candidate-only reverse discovery. Once no discovery pair is unresolved, each F2 press refreshes only current `Active` pairs plus manual `ForceInclude` currencies. League-scoped manual overrides can keep selected currencies in refresh or remove them from discovery, active-market output, and conversion-graph edges.
 
 Current source layout:
 
 | File | Responsibility |
 | --- | --- |
-| `ExchangeRates.cs` | API-independent currency identities, directed pair keys, exact rational rates, whole-unit conversion, snapshots, and latest-rate storage |
+| `ExchangeRates.cs` | API-independent identities, exact rates, whole-unit conversion, and league-scoped latest/fresh quote views |
 | `CurrencyExchangeRateCollector.cs` | Adapter from `CurrencyExchangePanel` public properties into domain snapshots |
 | `CurrencyCatalogue.cs` | Deterministic catalogue keyed by `BaseItemType.Metadata`, built from the Currency Exchange DAT wrapper |
 | `CurrencyScanPlan.cs` | De-duplicated plan for all directed pairs where Chaos or Divine is one endpoint |
+| `CurrencyMarketDiscovery.cs` | Compact league-scoped active Chaos/Divine market evidence and atomic JSON export |
+| `CurrencyConversionGraph.cs` | Full-catalogue vertices, coherent fresh directed exact-rate edges, exclusion diagnostics, and atomic JSON export |
+| `CurrencyDiscoveryProbeStore.cs` | Latest per-pair discovery outcomes, validation, counts, and atomic resumable registry |
+| `CurrencyDiscoveryOverrides.cs` | League-scoped manual force-include/force-skip identities and atomic default-file creation |
+| `LiquidityDiscoveryController.cs` | Cancellable full-phase F2 orchestration that continues past confirmed no-market pairs |
 | `CurrencyPickerInspector.cs` | Read-only visible picker-option identity, owned amount, and center-coordinate inspection |
 | `CurrencySearchQueryController.cs` | Foreground-gated Ctrl+F, Ctrl+A, token entry, timeout, cancellation, and exact metadata verification |
 | `CursorTweenController.cs` | Non-blocking curved cursor interpolation with continuous target/context validation and manual interruption detection |
@@ -28,8 +33,8 @@ Current source layout:
 | `PickerButtonCalibration.cs` | Manual picker-open transition capture, panel-relative calibration, atomic JSON persistence, and target resolution |
 | `CalibratedPickerOpenController.cs` | Curved movement to one calibrated picker button, one click, and expected-side verification without retry |
 | `SinglePairScanController.cs` | One-pair orchestration across verified controllers, stable-rate sampling, capture, and hard stop |
-| `BoundedScanController.cs` | Bounded initial-scope iteration, per-run freshness/uniqueness guards, persistence handshake, and explicit cancellation |
-| `RateCaptureJsonExporter.cs` | Versioned, atomic JSON export of raw and normalized snapshots |
+| `BoundedScanController.cs` | Bounded iteration, capture persistence handshake, immutable scan progress/revisions, and explicit cancellation |
+| `RateCaptureJsonExporter.cs` | Schema migration, latest captures, coherent latest-scan manifest validation, and atomic persistence |
 | `FaustusController.cs` | ExileAPI lifecycle, capture hotkey handling, and minimal status rendering |
 | `FaustusControllerSettings.cs` | Small user-configurable settings only |
 
@@ -51,6 +56,70 @@ Self-pairs and duplicate Chaos/Divine cross-pairs are removed. Currency order is
 When a picker is open, inspect `CurrencyPicker.Options`, resolve each visible option by `ItemType.Metadata`, and derive its center from `GetClientRectCache`. Retain only immutable identity and coordinate values; never retain the `Element`. Re-inspect every tick while previewing so scrolling and layout changes update the target. The yellow `DRY RUN TARGET` label is visualization only and must not generate input.
 
 The original alphabetical first step, `A Chilling Wind -> Chaos Orb`, frequently had no positive market rate. The runtime-test start was changed to `Orb of Alteration -> Chaos Orb` so stable-rate capture and multi-pair advancement can be exercised with a liquid pair. The preview still clears on area change.
+
+### Active Market Discovery Strategy
+
+The game catalogue is the candidate universe, not the active market list. Discover liquidity empirically in two phases:
+
+```text
+Phase 1 sell-side probes:
+  X -> Chaos
+  X -> Divine
+
+Phase 2 reverse probes for phase-1 candidates only:
+  Chaos -> X
+  Divine -> X
+```
+
+Phase 1 is already represented by `CurrencyScanPlan.InitialCollectionSteps` and contains `2N - 2` unique pairs. A positive exact market rate proves that the directed pair was actively listed at `CapturedAtUtc`. Absence from successful captures means only `untested or not observed`; it must not be labeled inactive, Chaos-only, or Divine-only until an explicit negative probe completes. This distinction matters for high-value markets such as Mirror of Kalandra, which may be actively quoted against Divine but not Chaos.
+
+As soon as `Tick` can build the live catalogue, and after every successfully persisted F4/F6/F3 capture, atomically regenerate:
+
+```text
+<ConfigDirectory>/FaustusController_active-markets.json
+```
+
+Schema v1 is intentionally compact and contains only currencies with at least one positive observed base-market direction. `ChaosMarket` and `DivineMarket` retain their original sell-side meaning (`X -> base`); `ChaosBuyMarket` and `DivineBuyMarket` store reverse buy-side evidence (`base -> X`). `ObservedDirections` explicitly lists `SellForChaos`, `BuyWithChaos`, `SellForDivine`, and/or `BuyWithDivine`, while `ObservedMarkets` remains the broad Chaos/Divine coverage label. Each direction stores the exact rate, capture/scan IDs, timestamp and age, freshness at generation, immediate/competing row counts, aggregate `ListedCount` diagnostics, and whether both books are populated. It does not duplicate individual stock rows.
+
+The compact registry retains the newest validated positive observation per currency/base side even if the latest full rate capture later has a null market rate. A null latest capture is not an explicit negative probe and must not erase prior evidence. Regeneration reads the durable rate-capture file rather than unpersisted in-memory snapshots, validates retained compact summaries, and retries catalogue availability or failed writes every two seconds. F7 remains a manual regeneration path but is not required for initial file creation. F3 does not confirm/advance a pair when required active-market regeneration fails.
+
+Do not call this file a popularity ranking yet. The public panel exposes current quote and order-book evidence, not executed trade volume. `ListedCount` may help rank apparent depth but is not validated fillable volume. A later classifier may use repeated probe success, freshness, two-sided depth, spread, and explicit negative outcomes to produce categories such as `ChaosOnly`, `DivineOnly`, `Both`, and `Inactive`.
+
+F2 implements full initial discovery, candidate-only reverse discovery, and active refresh with `AllowLiquidityDiscoveryAutomation` disabled by default. There is no pair-count cap: one run processes the complete current phase, but remains explicitly cancellable with F2 at any time. It uses the same calibrated picker, exact metadata query, cursor tween, guarded click, and foreground/cancellation rules as F3. Reverse discovery remains dormant while any non-skipped phase-one outcome is missing or `Failed`. Once phase one is complete, the eligible set expands by the distinct inverse of each phase-one `Active` or manually included pair; inverses already present in phase one are not duplicated. After all eligible pairs are terminal, later runs refresh only pairs whose latest outcome is `Active` or whose non-base currency is manually included.
+
+Create and manually edit the league-scoped override file:
+
+```text
+<ConfigDirectory>/FaustusController_discovery-overrides-<sanitized-league>.json
+```
+
+```json
+{
+  "SchemaVersion": 1,
+  "League": "Standard",
+  "ForceInclude": [
+    {
+      "Metadata": "Metadata/Items/Currency/example",
+      "Name": "Example Currency"
+    }
+  ],
+  "ForceSkip": []
+}
+```
+
+Metadata is authoritative; `Name` is for readability. Entries must exist in the live catalogue, must be unique, and cannot appear in both lists. Chaos Orb and Divine Orb cannot be overridden. F2 reloads this file whenever a new run starts. `ForceInclude` keeps both base-market directions eligible for discovery/refresh even after no-market or unavailable outcomes. `ForceSkip` removes that currency from pending discovery and refresh, suppresses it from active-market output, and excludes its positive captures from graph edges without deleting durable captures or probe history.
+
+Persist outcomes atomically to:
+
+```text
+<ConfigDirectory>/FaustusController_discovery-probes-<sanitized-league>.json
+```
+
+Each league has a separate registry containing one latest outcome per directed pair, so switching leagues cannot erase or reuse another league's discovery progress. Existing positive durable captures seed `Active` outcomes so known pairs are not needlessly reprobed. Each F2 run selects the earliest unresolved plan steps, where both untested and prior `Failed` outcomes are unresolved, and skips persisted `Active`, `NoMarketRate`, and `Unavailable` outcomes. This immediately retries a corrected automation failure at the discovery frontier instead of postponing it behind every untested pair. A verified pair becomes `NoMarketRate` immediately after three consecutive readable exact-pair null-rate samples at 100 ms intervals, provided there was no unreadable poll failure or positive market rate. With the 500 ms initial settle delay this normally takes about 700 ms after both currencies are verified. If any positive quote appears but does not stabilize, or polling becomes unreadable, the result is `Failed` after the existing five-second timeout, not a negative market conclusion.
+
+If an entered query remains readable but produces no exact metadata match for the full filter timeout, F2 records `Unavailable` and intentionally leaves the picker open. Unrelated visible results do not change this classification: exact metadata remains the acceptance criterion, and stale catalogue entries such as `Desecration` and `Coin of Power` can otherwise produce broad mismatches. For the next probe, F2 verifies the panel and active picker side, then reuses the picker through the existing Ctrl+F, Ctrl+A, and guarded query-entry sequence. Selecting the next exact metadata match closes the picker normally. An explicitly started F2 run may also adopt a currently visible picker, which allows recovery from an unavailable item at the end of the previous phase run. F3 and F4 still require a closed picker. Input, context, and picker-inspection failures remain `Failed`. `Unavailable` is terminal unless manually force-included and can clear older compact evidence for the same direction.
+
+`Active` requires the full rate capture, active-market summary, and probe outcome to persist before advancing. `NoMarketRate` requires the probe outcome and removal of older positive compact evidence before advancing. Automation/context `Failed` outcomes persist their reason and stop the run. Newer positive evidence supersedes an older negative outcome; a newer explicit negative removes older positive active-market evidence. All three files remain latest-only and bounded by pair count.
 
 ### Search-First Picker Strategy
 
@@ -83,7 +152,9 @@ Completed              exact ItemType.Metadata is visible
 Faulted                foreground, panel, picker side, input, or timeout failure
 ```
 
-To avoid keyboard-layout-sensitive punctuation, derive the query from the longest lowercase alphanumeric token in the currency name. Examples: `Chaos Orb -> chaos`, `A Chilling Wind -> chilling`, and `Engineer's Orb -> engineer`. A partial query is acceptable only because completion requires an exact metadata match. F9 never clicks the result. Disable `AllowSearchQueryInput`, change areas, close/swap the picker, lose foreground, hold a modifier, or exceed the operation timeout to cancel without further characters. F8 is blocked while automatic query entry is active.
+To avoid broad result sets such as the hundreds returned by `scarab`, derive the query against the full live catalogue. Normalize names to lowercase alphanumeric words, evaluate contiguous word phrases, choose the shortest phrase with exactly one catalogue-name match when possible, and otherwise choose the phrase with the fewest matches. Common stopwords and short fragments are not allowed as standalone queries; phrases with weak boundary words are ranked behind cleaner phrases but remain available when they are the only unique option. Keyboard encoding supports lowercase letters, digits, spaces, and double quotes through guarded Shift+OemQuotes strokes. For example, a base Abyss Scarab among more than 100 scarabs falls back to `abyss scarab`, while a specific variant may use a unique word such as `multitudes`. Completion still requires the target's exact metadata to be visibly present; query uniqueness alone never authorizes movement or clicking. F9 never clicks the result. Disable `AllowSearchQueryInput`, change areas, close/swap the picker, lose foreground, hold a modifier, or exceed the operation timeout to cancel without further characters. F8 is blocked while automatic query entry is active.
+
+F2 has one explicit query-refinement exception to the general no-retry rule. A normal query may return many rows; that is acceptable whenever the exact metadata row is visible and its center is inside the picker rectangle. The number of other visible results never triggers refinement or blocks selection. Only when the normal query does not expose an exact selectable row, replace it once with the quoted normalized full name, for example `of the pa` becoming `"honoured tattoo of the pa"`. Re-run exact metadata and geometry verification before allowing movement. If the quoted query still has no exact selectable row, persist `Unavailable`, leave the picker open, and continue with the next probe. Never retry mouse movement or a click, and do not use the quoted fallback for foreground, context, inspection, typing, modifier, selection-timeout, or manual-interruption failures.
 
 Runtime testing found that the picker search box is focused as soon as the picker opens and remains focused after a query. `HotkeyNodeV2` normally suppresses plugin hotkeys while a text input is focused, which made the first or repeated F9 press appear ineffective until clicking the picker removed text focus. Set `IgnoreFocusedInput = true` on both F8 and F9, enforce it again during plugin initialization for existing settings, and wait for the physical activation key to be released before generating Ctrl+F. No focus-establishing mouse click is required.
 
@@ -161,7 +232,7 @@ Never click the first search result blindly. Re-read `CurrencyPicker.Options` an
 10. Press F, A, and Ctrl normally afterward to confirm no key remains held.
 11. Press F9 again while the search field remains focused and without clicking the picker. Confirm the hotkey is detected and Ctrl+A replaces the existing query rather than appending.
 12. Move to another area during or after a query. Confirm the query operation and preview clear.
-13. Press F6 on a selected pair. Confirm normal capture still updates `config/FaustusController/FaustusController_rate-captures.json` with corrected schema v1 data.
+13. Press F6 on a selected pair. Confirm normal capture updates the matching schema-v4 latest capture in `config/FaustusController/FaustusController_rate-captures.json`.
 
 ### Mouse Movement Test
 
@@ -306,7 +377,7 @@ After both panel item types match:
 3. Require the captured pair metadata to equal the planned directed pair.
 4. Require a positive market rate.
 5. Require three consecutive identical raw `Get:Give` samples.
-6. Store the final immutable snapshot in `ExchangeRateBook` and export through the existing schema-v1 JSON exporter.
+6. Store the final immutable snapshot in `ExchangeRateBook`, overwrite its schema-v4 league/pair capture, and reference it from the F3 manifest only after persistence succeeds.
 7. Stop in `Completed`; never advance to the next plan step.
 
 The overall operation timeout is 30 seconds and the stable-rate timeout is 5 seconds. Losing foreground, changing areas, disabling any required permission, manual mouse interruption, controller failure, or timeout faults the run without automatic retry. Manual F5-F11 operations are blocked while F4 runs. F7 explicitly cancels F4 and creates a new preview.
@@ -476,9 +547,24 @@ Do not combine gold and currency into one scalar unless an explicit gold valuati
 
 An optimizer edge should reference the immutable snapshot it came from so route results can report quote age and be invalidated before execution. The optimizer should never read `CurrencyExchangePanel` directly.
 
-### Collection Freshness and History
+### Collection Freshness and Latest Rates
 
-The current `ExchangeRateBook` stores only the latest snapshot per pair in its private `_latestByPair` dictionary. That dictionary exists only in the active plugin process. It is retained across area changes but lost on plugin reload or process exit. A bounded F3 run tracks an in-memory scan identifier, start time, latest capture time, and captured-pair set, but schema v1 does not yet persist the scan identifier.
+`ExchangeRateBook` stores exactly one latest snapshot by `(league, offered metadata, wanted metadata)`. A newly accepted live capture authoritatively overwrites that key even if the system clock moved backward. Persisted captures are loaded back into the rate book during plugin initialization, so process reload does not discard collected rates.
+
+Every latest capture includes:
+
+```text
+CaptureId             unique observation GUID
+CapturedAtUtc         quote observation time
+League                ServerData.League captured from live game memory
+AreaInstanceId        diagnostic provenance only
+CollectorSessionId    plugin-instance GUID, not a server session ID
+ScanId                F3 run GUID; null for F4/manual captures
+ScanSequence          one-based F3 position; null for F4/manual captures
+Source                Manual, SinglePairAutomation, BoundedScanAutomation, or LiquidityDiscoveryAutomation
+```
+
+There is no evidenced public ExileAPI realm or stable server-session ID. Do not mislabel `ServerData.InstanceId` as a session; it is area-instance provenance. Require a nonblank live league before collecting. A bounded scan records its starting league and rejects a snapshot if that league changes.
 
 After every successful capture, export the rate book to:
 
@@ -486,22 +572,161 @@ After every successful capture, export the rate book to:
 <ConfigDirectory>/FaustusController_rate-captures.json
 ```
 
-For this distribution, `ConfigDirectory` resolves to `config/FaustusController`. Schema v1 uses the corrected stock-side direction mapping and includes both currency identities, capture timestamps, market rates, top immediate and competing rates, every raw stock row, selected-pair rates, and listing counts. Export through a temporary file followed by an atomic replacement. Merge with an existing schema-compatible export by directed pair so plugin reloads do not erase previously exported pairs. This is pre-release development, so do not add migration or backward-compatibility code; discard invalid development captures when the schema changes.
+For this distribution, `ConfigDirectory` resolves to `config/FaustusController`. Schema v4 contains a flat deterministic `Captures` array with one record per league/directed-pair key, an optional `LatestBoundedScan`, and an optional `LatestCompletedBoundedScan` retained for graph coherence while a newer scan is running or faulted. Rate rows retain exact raw/reduced ratios, derived decimals, corrected stock direction, listing counts, and capture context. Each successful live capture overwrites that key; exporting all in-memory latest captures retries unrelated captures retained after a transient write failure without creating history. Validate all existing identities, source-specific scan context, ratios, stock rows, derived values, and manifest references before replacement; then write through a same-directory temporary file followed by atomic replacement.
 
-A future history increment should add league, scan identifier, and optional failure/staleness reason. Apply a configurable maximum quote age before building graph edges; never silently mix fresh and stale observations from different scans.
+Schema-v2 histories are validated completely, then collapsed to their newest timestamp/capture-ID observation per league/pair during migration. Schema-v1 files remain supported because useful captures already exist; they are preserved under the explicit `unknown-schema-v1` league with `LegacySchema1` source, empty collector session, and no scan context. Never infer a league for old data. Legacy captures do not count as fresh quotes for the current league.
+
+`MaximumQuoteAgeMinutes` defaults to 15 and is constrained to 1-1440. The current UI reports only the number of latest positive market quotes in the current league whose timestamps are not in the future and are within that age. Graph construction additionally requires exact coherence. An F2 capture must match the current `Active` outcome by pair, capture ID, run ID, sequence, and timestamp. An F3 capture must match the latest `Completed` manifest by league, collector session, scan ID, pair, capture ID, and sequence. Manual/F4 captures and incomplete, faulted, invalidated, overwritten, or mismatched scan references are not graph edges.
+
+Retain the latest F3 lifecycle manifest plus the latest completed F3 manifest; this is bounded state, not scan history. Starting or faulting a newer scan replaces `LatestBoundedScan` but does not erase prior completed provenance. Planned pairs and persisted references are contiguous one-based sequences. `Completed` requires every planned capture; `Faulted` records a reason and any successfully persisted prefix. A new plugin collector session converts an old nonterminal manifest to interrupted `Faulted`. If a referenced latest capture is overwritten by F4, F6, or a later scan, either retained manifest becomes `Invalidated`. Manifest writes occur before F3 input begins, after each lifecycle revision, and every two seconds after a transient terminal-write failure.
+
+### Latest Rate Test
+
+1. Reload the plugin with the existing schema-v3 file. Confirm initialization succeeds and rewrites it as schema version 4.
+2. Confirm the root contains `Captures` and no `Series` or `History` arrays.
+3. Confirm each `(League, OfferedCurrency.Metadata, WantedCurrency.Metadata)` key appears exactly once and the retained capture is the newest prior observation.
+4. Press F6 for Divine Orb -> Chaos Orb. Confirm the matching capture gets a new `CaptureId`, timestamp, exact rates, and stock rows while the total capture count remains unchanged.
+5. Press F6 for a new directed pair. Confirm the total capture count increases by exactly one.
+6. Run F4 once. Confirm source `SinglePairAutomation`, a nonempty collector-session ID, and null scan fields.
+7. Run F3 for two pairs. Confirm both retained captures share one nonempty `ScanId`, use source `BoundedScanAutomation`, and have unique sequences 1 and 2.
+8. Reload the plugin. Confirm the overlay restores the latest capture count and reports current-league fresh latest market quotes.
+9. Set `MaximumQuoteAgeMinutes` to 1. Confirm captures older than one minute stop contributing to the fresh quote count without being removed.
+10. In a controlled test, make the export path temporarily unwritable and capture one pair. Restore write access and capture a different pair. Confirm the retained in-memory latest capture from the failed write is persisted on the later successful export.
+11. Test a copied file with a corrupted raw/reduced ratio, duplicate capture ID, duplicate scan sequence, or invalid source/scan context. Confirm validation rejects it before replacing that file.
+
+The latest-rate test fails if migration retains multiple captures for a league/pair, repeated captures append data, a live capture fails to overwrite because of clock ordering, reload starts empty, stale quotes count as fresh, or malformed context/rates are accepted.
+
+### Scan Manifest Test
+
+1. Reload schema v4 before starting F3. Confirm `LatestBoundedScan` is null or contains the prior terminal scan.
+2. Set `PairsPerBoundedScan` to 2, press F7, then start F3.
+3. Immediately confirm `LatestBoundedScan.State` is nonterminal, has a nonempty `ScanId` and `CollectorSessionId`, and lists exactly two unique planned pairs before automated input progresses.
+4. If a prior `LatestCompletedBoundedScan` exists, confirm starting the new scan does not erase or replace it.
+5. After the first pair persists, confirm `PersistedCaptures` contains sequence 1 with a capture ID matching the corresponding entry in `Captures`.
+6. After the second pair, confirm state `Completed`, a terminal timestamp, no failure reason, and contiguous persisted sequences 1 and 2 matching both latest captures; confirm `LatestCompletedBoundedScan` now references this scan.
+7. Start another scan and press F3 to cancel after one persisted pair. Confirm state `Faulted`, a cancellation reason, and only the successfully persisted contiguous prefix while the prior completed manifest remains.
+8. Start a scan and reload or terminate the plugin before completion. On the next load, confirm the old nonterminal manifest becomes `Faulted` with an interruption reason.
+9. Complete a two-pair scan, then manually F6-capture one referenced pair. Confirm that latest pair is overwritten and the corresponding preserved manifest changes to `Invalidated` without changing its invalidation timestamp on later unrelated exports.
+10. Start a new F3 scan. Confirm its lifecycle manifest replaces the prior lifecycle manifest rather than appending scan history.
+11. In a controlled unwritable-path test, confirm F3 sends no initial input if its start manifest cannot persist, faults the scan, and retries terminal persistence at two-second intervals without retrying game input.
+
+The manifest test fails if F3 starts input before its manifest exists, advances before a capture reference persists, marks an incomplete scan completed, accepts noncontiguous references, leaves an interrupted scan running, treats overwritten captures as coherent, grows an unbounded manifest list, or retries game input after persistence failure.
+
+### Active Market Discovery Test
+
+1. Reload the plugin and confirm `config/FaustusController/FaustusController_active-markets.json` is created automatically once the live catalogue is available; F7 should also regenerate it manually.
+2. Confirm `CatalogueCurrencyCount` matches the displayed catalogue count and `EligibleProbePairCount` equals `2N - 2`.
+3. Confirm `Currencies` contains only entries backed by a positive current-league `X -> Chaos` or `X -> Divine` observation; a retained positive may be older than a later null-rate full capture.
+4. Capture Divine Orb -> Chaos Orb. Confirm Divine Orb has `ObservedMarkets: ChaosObserved`, a nonnull `ChaosMarket`, and no inferred Divine-side status.
+5. Capture one currency against both Chaos and Divine. Confirm its single compact entry becomes `ChaosAndDivineObserved` without duplicating the currency.
+6. Confirm each market summary links to the newest retained positive `CaptureId`, preserves exact raw/reduced rate units, and reports stock row/count evidence without individual stock arrays.
+7. Set `MaximumQuoteAgeMinutes` low and regenerate with F7. Confirm old observations remain in the evidence list but `FreshAtGeneration` becomes false.
+8. Confirm a catalogue currency with no successful probe is absent rather than labeled inactive or assigned to the opposite market.
+
+The active-market test fails if stale/foreign-league captures are mislabeled fresh, missing evidence is treated as a negative probe, one currency is duplicated for two base markets, exact rates change, or the compact file duplicates full stock ladders.
+
+### Liquidity Discovery Runner Test
+
+1. Reload the plugin and confirm `FaustusController_discovery-probes-Standard.json` (or the sanitized current league name) is created and seeded from existing positive phase-one captures.
+2. Confirm `FaustusController_discovery-overrides-Standard.json` is created with empty `ForceInclude` and `ForceSkip` arrays.
+3. Leave `AllowLiquidityDiscoveryAutomation` disabled and press F2. Confirm no input occurs.
+4. Enable the F2 master toggle and the same four picker/query/movement/click permissions required by F3, then press F2 with the panel visible and picker closed.
+5. Confirm status says `Full initial discovery`, skips completed `Active`/`NoMarketRate`/`Unavailable` pairs, and plans every remaining untested or `Failed` non-skipped phase-one pair without a 100-pair cap.
+6. For a pair with a positive stable rate, confirm an `Active` outcome references the exact persisted capture ID before the next probe starts.
+7. For a verified pair with no positive rate, confirm three consecutive readable null samples complete in about 700 ms, `NoMarketRate` persists with no capture ID, and F2 advances after its separate 500 ms between-pair delay.
+8. Cancel the long run with F2. Confirm the current pair persists `Failed`, input stops without retry, and the next F2 press resumes all remaining phase-one work.
+9. After initial discovery completes, press F2 and confirm status says `Active-candidate reverse discovery`; only inverses of active or force-included candidates are planned.
+10. After reverse discovery completes, press F2 and confirm status says `Active listing refresh`; every current active pair is planned once, while no-market/unavailable pairs are omitted unless force-included.
+11. Force a refreshed active pair to return no market. Confirm its outcome becomes `NoMarketRate`, it is removed from later active-refresh runs, and its stale graph edge expires normally.
+12. During separate runs, disable a permission, move the mouse, close the panel, change area, and lose foreground. Confirm the current pair receives a persisted `Failed` reason, no input retries, and no false `NoMarketRate` result.
+13. Force a positive quote to remain unstable until timeout. Confirm the outcome is `Failed`, includes a reason, and stops the run rather than classifying the pair inactive.
+14. Confirm a newer explicit `NoMarketRate` outcome removes older positive evidence for that side from `active-markets.json`; then capture a newer positive rate and confirm it restores `Active` evidence.
+15. Probe a stale catalogue entry whose query produces no exact metadata match, both with zero results and with unrelated visible results. Confirm no Escape is sent, the picker remains open, the outcome persists as `Unavailable`, `UnavailableCount` increments, and F2 starts the next query in the same picker through Ctrl+F/Ctrl+A.
+16. Confirm input, context, or picker-inspection failures still persist `Failed` and stop rather than being classified as unavailable.
+17. End a phase run on an unavailable item, press F2 again with the picker still open, and confirm the new run adopts that picker and replaces its query for the next unresolved probe.
+18. Probe `Honoured Tattoo of the Pa`. Confirm the initial broad query may be rejected for out-of-bounds target geometry before movement, then exactly one quoted `"honoured tattoo of the pa"` query replaces it. Confirm a valid exact row proceeds normally; if the quoted row is absent or still out of bounds, confirm `Unavailable` persists and F2 reuses the open picker for the next probe.
+19. Probe `The Pack Leader`. Confirm `pack` may show multiple options, but an exact visible metadata row proceeds directly to verified movement and selection without quoting merely because other rows exist.
+20. Probe Divine Orb and confirm `divine orb` may show several listings while the exact Divine Orb row is selected directly. Confirm quotes are used only if the exact row is absent or outside the usable picker rectangle.
+21. Confirm F3-F12 manual/automated actions are blocked while F2 is active, including F7/F12 rather than cancelling it, and F2 cannot start while F3/F4 is active.
+
+The liquidity-discovery test fails if untested and no-market are conflated, F2 stops at an arbitrary pair cap, active refresh includes nonactive non-overridden pairs, F2 advances before all required files persist, a context failure becomes negative evidence, or input retries after cancellation/failure.
+
+### Discovery Override Test
+
+1. Copy an exact non-base metadata/name object from the catalogue or active-market file into `ForceSkip`, then press F2 to reload overrides.
+2. Confirm all directed pairs involving that currency are removed from pending discovery and active refresh.
+3. Confirm the currency disappears from `FaustusController_active-markets.json` and its positive graph edges move to `ExcludedManualSkipCount`; source captures and probe outcomes remain intact.
+4. Move the same entry to `ForceInclude`, press F2, and confirm both Chaos/Divine phase-one pairs and eligible reverse pairs remain scheduled even after no-market/unavailable outcomes.
+5. Remove the override and confirm normal outcome-driven active refresh resumes.
+6. Confirm unknown metadata, duplicate entries, overlap between lists, league mismatch, or Chaos/Divine entries reject the override file and block new F2 input without changing durable captures.
+
+The override test fails if names replace metadata identity, skipped currencies remain graph edges, included currencies disappear after a negative outcome, invalid overrides generate input, or editing overrides deletes observation history.
+
+### Reverse Discovery Test
+
+1. Before phase one is complete, confirm every F2 candidate still has Chaos or Divine as the wanted currency; no `base -> X` reverse probe may start early.
+2. On a copied synthetic/controlled registry, mark every phase-one pair resolved and leave two currencies `Active`: one against Chaos and one against Divine.
+3. Start F2 and confirm only `Chaos -> first currency` and `Divine -> second currency` become reverse candidates; phase-one `NoMarketRate` currencies receive no reverse probe.
+4. Confirm an active reverse Chaos probe writes `ChaosBuyMarket` and adds `BuyWithChaos` to `ObservedDirections` without replacing `ChaosMarket` sell evidence.
+5. Confirm an active reverse Divine probe writes `DivineBuyMarket` and `BuyWithDivine` independently.
+6. Confirm a reverse `NoMarketRate` outcome removes only the corresponding buy-side evidence and does not remove sell-side evidence.
+7. Confirm Chaos/Divine cross-pairs already present in phase one are not scheduled or counted twice.
+8. Confirm `EligibleProbePairCount` remains 2202 until phase one completes, then increases only by the distinct active-candidate reverse count.
+
+The reverse-discovery test fails if phase two starts early, inactive candidates are reverse-probed, buy and sell directions overwrite one another, base cross-pairs duplicate, or reverse evidence lacks exact capture linkage.
+
+### Conversion Graph
+
+Regenerate the graph atomically at:
+
+```text
+<ConfigDirectory>/FaustusController_conversion-graph.json
+```
+
+Schema v1 is deterministic and contains the full live catalogue in `Vertices`, plus only eligible directed captures in `Edges`. Each edge stores offered/wanted metadata, immutable capture/collector/scan references, capture time and generated age, capture source, coherence source, and exact raw/reduced `Get/Give` values. `WantedPerOffered` remains a derived display value. No reciprocal edge is inferred.
+
+Eligibility is evaluated against durable files, not the live panel:
+
+1. Capture league exactly matches the current league.
+2. Both metadata identities exist in the current catalogue and differ.
+3. `MarketRate` is positive.
+4. Capture time is not in the future and is within `MaximumQuoteAgeMinutes`.
+5. F2 source requires an exact current `ActiveDiscoveryProbe` linkage.
+6. F3 source requires an exact `CompletedBoundedScan` manifest linkage.
+
+The root records current-league capture count and mutually exclusive exclusions for null rate, unknown currency, future timestamp, stale timestamp, incoherent provenance, and manual skip. Edge count plus all exclusions must equal current-league capture count. Regeneration is retryable every two seconds after failure and never changes scanner state or retries game input.
+
+### Conversion Graph Test
+
+1. Reload the plugin and confirm `FaustusController_conversion-graph.json` is created after the live catalogue and current league become available.
+2. Confirm `VertexCount` and `Vertices.Count` equal the live catalogue count, with unique metadata identities.
+3. Confirm every edge direction equals its source snapshot direction and no reverse edge exists unless separately captured and coherent.
+4. Confirm every edge has positive exact raw/reduced rates and references the matching latest capture ID.
+5. Confirm an F2 edge matches an `Active` outcome by pair, capture ID, run ID, sequence, and timestamp.
+6. Confirm an F3 edge appears only through `LatestCompletedBoundedScan` and references that exact pair/capture/sequence; starting a newer scan must not erase still-current completed edges.
+7. Overwrite a referenced F3 capture or replace/invalidate its manifest. Confirm that edge disappears on regeneration.
+8. Set `MaximumQuoteAgeMinutes` below an edge's age and regenerate. Confirm it moves from `Edges` to `ExcludedStaleCount` without deleting the source capture.
+9. Confirm future timestamps, null rates, manual/F4 captures, failed/no-market/unavailable F2 outcomes, malformed per-capture provenance, and mismatched capture references never become edges. A malformed capture must increment `ExcludedIncoherentCount` without blocking valid edges.
+10. Confirm `EdgeCount + all Excluded*Count` equals `CurrentLeagueCaptureCount`.
+11. Make the graph path temporarily unwritable. Confirm collection remains persisted and continues, graph status reports failure, and graph export retries without sending game input.
+
+The graph test fails if stale or incoherent captures become edges, a reciprocal rate is inferred, exact ratios change, duplicate vertices/edges appear, a derived write failure blocks collection, or exclusion accounting is incomplete.
 
 Keep each stock row's raw ratio as well as its normalized selected-pair comparison ratio. Do not treat `ListedCount` as available currency volume without validation; its public name supports listing count, not necessarily fillable units.
 
 ### Planned Expansion Boundaries
 
-1. Persist versioned snapshots separately from the static currency catalogue.
-2. Add a bounded history per directed pair and freshness/league metadata.
+1. Completed: persist versioned snapshots separately from the static currency catalogue.
+2. Completed: add latest-only per-league directed-pair storage, schema-v1/v2 migration, reload, capture/scan identity, and quote-age metadata.
 3. Completed: add a cancelable bounded scanner that selects by `ItemType.Metadata`, waits for stable rates, persists, then advances.
-4. Current scope: scan only `currency -> Chaos` and `currency -> Divine` pairs before attempting the full directed graph.
-5. Build a graph where currencies are vertices and fresh executable quotes are directed edges.
-6. Add balances, stock/liquidity limits, gold costs, and whole-unit remainders to route simulation.
-7. Add bounded path search with cycle prevention and configurable maximum hops.
-8. Add dry-run route display before any order placement automation.
+4. Completed: derive a compact active-market evidence list from successful `currency -> Chaos` and `currency -> Divine` captures.
+5. Completed: persist latest `Active`/`NoMarketRate`/`Unavailable`/`Failed` outcomes and resume F2 discovery past confirmed no-market or unavailable pairs.
+6. Completed: after phase one completes, reverse-probe only active candidates and preserve independent buy/sell direction evidence.
+7. Completed: build a graph where currencies are vertices and only current, coherent, fresh active captures become directed edges.
+8. Current: run complete discovery phases, refresh active listings, and apply league-scoped manual include/skip overrides.
+9. Next: add balances, stock/liquidity limits, gold costs, and whole-unit remainders to route simulation.
+10. Add bounded path search with cycle prevention and configurable maximum hops.
+11. Add dry-run route display before any order placement automation.
 
 The future scanner should use explicit states such as `Idle`, `OpenPicker`, `SelectCurrency`, `WaitForSelection`, `WaitForRate`, `Capture`, `Advance`, `Completed`, and `Faulted`. It must reacquire panel/option elements on every state transition and obey the input safety rules below.
 

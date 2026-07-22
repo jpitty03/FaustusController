@@ -12,16 +12,43 @@ public enum BoundedScanState
     Faulted
 }
 
+public sealed record BoundedScanPairReference(
+    int Sequence,
+    CurrencyPairKey Pair);
+
+public sealed record BoundedScanCaptureReference(
+    int Sequence,
+    Guid CaptureId,
+    CurrencyPairKey Pair);
+
+public sealed record BoundedScanProgress(
+    Guid ScanId,
+    Guid CollectorSessionId,
+    string League,
+    DateTimeOffset StartedAtUtc,
+    DateTimeOffset UpdatedAtUtc,
+    DateTimeOffset? TerminalAtUtc,
+    BoundedScanState State,
+    string? FailureReason,
+    IReadOnlyList<BoundedScanPairReference> PlannedPairs,
+    IReadOnlyList<BoundedScanCaptureReference> PersistedCaptures);
+
 public sealed class BoundedScanController
 {
     private static readonly TimeSpan BetweenPairDelay = TimeSpan.FromMilliseconds(500);
 
     private readonly SinglePairScanController _pairController = new();
     private readonly HashSet<CurrencyPairKey> _capturedPairs = [];
+    private readonly List<BoundedScanCaptureReference> _persistedCaptures = [];
     private IReadOnlyList<CurrencyScanPlanStep> _steps = [];
     private int _currentStepIndex;
     private DateTimeOffset _nextPairAtUtc;
     private ExchangePairSnapshot? _pendingSnapshot;
+    private string _league = "";
+    private Guid _collectorSessionId;
+    private DateTimeOffset _updatedAtUtc;
+    private DateTimeOffset? _terminalAtUtc;
+    private string? _failureReason;
 
     public BoundedScanState State { get; private set; } = BoundedScanState.Idle;
     public string Status { get; private set; } = "Bounded scan automation is disabled by default.";
@@ -33,6 +60,7 @@ public sealed class BoundedScanController
     public DateTimeOffset? LastCapturedAtUtc { get; private set; }
     public int CapturedCount => _capturedPairs.Count;
     public int PlannedCount => _steps.Count;
+    public long Revision { get; private set; }
     public CurrencyScanPlanStep? CurrentStep =>
         _steps.Count == 0 ? null : _steps[_currentStepIndex];
     public ExchangePairSnapshot? PendingSnapshot =>
@@ -43,6 +71,7 @@ public sealed class BoundedScanController
         IReadOnlyList<CurrencyScanPlanStep> collectionSteps,
         CurrencyScanPlanStep firstStep,
         int maximumPairs,
+        Guid collectorSessionId,
         out string failureReason)
     {
         if (IsRunning)
@@ -55,9 +84,20 @@ public sealed class BoundedScanController
             return FailStart("Bounded scan requires at least one pair.", out failureReason);
         }
 
+        if (collectorSessionId == Guid.Empty)
+        {
+            return FailStart("Bounded scan requires a collector-session ID.", out failureReason);
+        }
+
         if (collectionSteps.Count == 0)
         {
             return FailStart("The initial bounded-scan collection scope is empty.", out failureReason);
+        }
+
+        var league = gameController.Game.IngameState.ServerData.League;
+        if (string.IsNullOrWhiteSpace(league))
+        {
+            return FailStart("Bounded scan requires a current nonblank league.", out failureReason);
         }
 
         var firstIndex = -1;
@@ -92,15 +132,23 @@ public sealed class BoundedScanController
         _steps = steps;
         _currentStepIndex = 0;
         _capturedPairs.Clear();
+        _persistedCaptures.Clear();
         _pendingSnapshot = null;
         ScanId = Guid.NewGuid();
         StartedAtUtc = DateTimeOffset.UtcNow;
         LastCapturedAtUtc = null;
+        _league = league;
+        _collectorSessionId = collectorSessionId;
+        _terminalAtUtc = null;
+        _failureReason = null;
+        State = BoundedScanState.RunningPair;
         if (!StartCurrentPair(gameController, out failureReason))
         {
+            Fault($"Bounded scan could not start its first pair: {failureReason}");
             return false;
         }
 
+        Touch();
         return true;
     }
 
@@ -143,7 +191,7 @@ public sealed class BoundedScanController
 
             if (!StartCurrentPair(gameController, out var startFailure))
             {
-                Cancel($"Bounded scan could not start the next pair: {startFailure}");
+                Fault($"Bounded scan could not start the next pair: {startFailure}");
             }
 
             return;
@@ -194,16 +242,27 @@ public sealed class BoundedScanController
             return;
         }
 
+        if (!string.Equals(snapshot.League, _league, StringComparison.Ordinal))
+        {
+            Cancel("Bounded scan rejected a capture from a different league.");
+            return;
+        }
+
         if (!_capturedPairs.Add(snapshot.Pair))
         {
             Cancel("Bounded scan rejected a duplicate directed-pair capture.");
             return;
         }
 
-        _pendingSnapshot = snapshot;
+        _pendingSnapshot = snapshot with
+        {
+            ScanId = ScanId,
+            ScanSequence = _currentStepIndex + 1
+        };
         State = BoundedScanState.AwaitingPersistence;
         Status = $"Scan {ShortScanId}, pair {_currentStepIndex + 1}/{_steps.Count} captured; " +
             "waiting for JSON persistence before advancing.";
+        Touch();
     }
 
     public bool ConfirmSnapshotPersisted(out string failureReason)
@@ -214,12 +273,19 @@ public sealed class BoundedScanController
             return false;
         }
 
-        LastCapturedAtUtc = _pendingSnapshot.CapturedAtUtc;
+        var persistedSnapshot = _pendingSnapshot;
+        LastCapturedAtUtc = persistedSnapshot.CapturedAtUtc;
+        _persistedCaptures.Add(new BoundedScanCaptureReference(
+            _currentStepIndex + 1,
+            persistedSnapshot.CaptureId,
+            persistedSnapshot.Pair));
         _pendingSnapshot = null;
         if (_currentStepIndex + 1 >= _steps.Count)
         {
             State = BoundedScanState.Completed;
+            _terminalAtUtc = DateTimeOffset.UtcNow;
             Status = $"Scan {ShortScanId} captured and persisted {_steps.Count} fresh pairs; stopped.";
+            Touch();
             failureReason = string.Empty;
             return true;
         }
@@ -229,19 +295,81 @@ public sealed class BoundedScanController
         State = BoundedScanState.BetweenPairs;
         Status = $"Scan {ShortScanId} persisted {_currentStepIndex}/{_steps.Count}; " +
             "waiting 500 ms before the next pair.";
+        Touch();
         failureReason = string.Empty;
         return true;
     }
 
     public void Cancel(string reason)
     {
+        if (!IsRunning)
+        {
+            return;
+        }
+
         if (_pairController.IsRunning)
         {
             _pairController.Cancel(reason);
         }
 
+        Fault(reason);
+    }
+
+    public void Block(string reason)
+    {
+        if (IsRunning)
+        {
+            return;
+        }
+
         State = BoundedScanState.Faulted;
         Status = reason;
+    }
+
+    public void FailPersistence(string reason)
+    {
+        if (ScanId == Guid.Empty || _steps.Count == 0 || State == BoundedScanState.Faulted)
+        {
+            return;
+        }
+
+        if (_pairController.IsRunning)
+        {
+            _pairController.Cancel(reason);
+        }
+
+        Fault(reason);
+    }
+
+    public BoundedScanProgress? GetProgress()
+    {
+        if (ScanId == Guid.Empty || _steps.Count == 0)
+        {
+            return null;
+        }
+
+        return new BoundedScanProgress(
+            ScanId,
+            _collectorSessionId,
+            _league,
+            StartedAtUtc,
+            _updatedAtUtc,
+            _terminalAtUtc,
+            State,
+            _failureReason,
+            _steps.Select((step, index) => new BoundedScanPairReference(
+                index + 1,
+                step.Pair)).ToArray(),
+            _persistedCaptures.ToArray());
+    }
+
+    private void Fault(string reason)
+    {
+        State = BoundedScanState.Faulted;
+        Status = reason;
+        _failureReason = reason;
+        _terminalAtUtc = DateTimeOffset.UtcNow;
+        Touch();
     }
 
     private string ShortScanId => ScanId.ToString("N")[..8];
@@ -253,14 +381,13 @@ public sealed class BoundedScanController
         var step = _steps[_currentStepIndex];
         if (!_pairController.Start(gameController, step, out failureReason))
         {
-            State = BoundedScanState.Faulted;
-            Status = failureReason;
             return false;
         }
 
         State = BoundedScanState.RunningPair;
         Status = $"Scan {ShortScanId}, pair {_currentStepIndex + 1}/{_steps.Count}: " +
             $"{step.OfferedCurrency.Name} -> {step.WantedCurrency.Name}.";
+        Touch();
         return true;
     }
 
@@ -270,5 +397,11 @@ public sealed class BoundedScanController
         Status = reason;
         failureReason = reason;
         return false;
+    }
+
+    private void Touch()
+    {
+        _updatedAtUtc = DateTimeOffset.UtcNow;
+        Revision++;
     }
 }

@@ -21,6 +21,20 @@ public sealed record CurrencyIdentity
 
 public readonly record struct CurrencyPairKey(string OfferedMetadata, string WantedMetadata);
 
+public readonly record struct LeagueCurrencyPairKey(
+    string League,
+    string OfferedMetadata,
+    string WantedMetadata);
+
+public enum ExchangeCaptureSource
+{
+    Manual,
+    SinglePairAutomation,
+    BoundedScanAutomation,
+    LiquidityDiscoveryAutomation,
+    LegacySchema1
+}
+
 public readonly record struct WholeUnitConversion(
     long OfferedUnits,
     long WantedUnits,
@@ -135,7 +149,8 @@ public sealed record ExchangeStockLevel
     {
         var selectedGet = side == ExchangeStockSide.OfferedItem ? rawGive : rawGet;
         var selectedGive = side == ExchangeStockSide.OfferedItem ? rawGet : rawGive;
-        if (!RationalExchangeRate.TryCreate(rawGet, rawGive, out var rawRate) ||
+        if (listedCount < 0 ||
+            !RationalExchangeRate.TryCreate(rawGet, rawGive, out var rawRate) ||
             !RationalExchangeRate.TryCreate(selectedGet, selectedGive, out var selectedPairRate))
         {
             level = null;
@@ -154,7 +169,10 @@ public sealed record ExchangeStockLevel
 }
 
 public sealed record ExchangePairSnapshot(
+    Guid CaptureId,
     DateTimeOffset CapturedAtUtc,
+    string League,
+    int AreaInstanceId,
     CurrencyIdentity OfferedCurrency,
     CurrencyIdentity WantedCurrency,
     RationalExchangeRate? MarketRate,
@@ -162,6 +180,14 @@ public sealed record ExchangePairSnapshot(
     IReadOnlyList<ExchangeStockLevel> OfferedItemStock)
 {
     public CurrencyPairKey Pair => new(OfferedCurrency.Metadata, WantedCurrency.Metadata);
+    public LeagueCurrencyPairKey LeaguePair => new(
+        League,
+        OfferedCurrency.Metadata,
+        WantedCurrency.Metadata);
+    public Guid CollectorSessionId { get; init; }
+    public Guid? ScanId { get; init; }
+    public int? ScanSequence { get; init; }
+    public ExchangeCaptureSource Source { get; init; }
     public ExchangeStockLevel? TopImmediateStock => WantedItemStock.FirstOrDefault();
     public RationalExchangeRate? TopImmediateRate => TopImmediateStock?.SelectedPairRate;
     public ExchangeStockLevel? TopCompetingStock => OfferedItemStock.FirstOrDefault();
@@ -170,22 +196,60 @@ public sealed record ExchangePairSnapshot(
 
 public sealed class ExchangeRateBook
 {
-    private readonly Dictionary<CurrencyPairKey, ExchangePairSnapshot> _latestByPair = [];
+    private readonly Dictionary<LeagueCurrencyPairKey, ExchangePairSnapshot> _latestByPair = [];
 
     public IReadOnlyCollection<ExchangePairSnapshot> LatestSnapshots => _latestByPair.Values;
+    public int Count => _latestByPair.Count;
 
     public void Store(ExchangePairSnapshot snapshot)
     {
-        _latestByPair[snapshot.Pair] = snapshot;
+        if (string.IsNullOrWhiteSpace(snapshot.League))
+        {
+            throw new ArgumentException("A snapshot league is required.", nameof(snapshot));
+        }
+
+        if (snapshot.CaptureId == Guid.Empty)
+        {
+            throw new ArgumentException("A snapshot capture ID is required.", nameof(snapshot));
+        }
+
+        _latestByPair[snapshot.LeaguePair] = snapshot;
     }
 
-    public bool TryGetLatest(CurrencyPairKey pair, out ExchangePairSnapshot? snapshot)
+    public bool TryGetLatest(
+        string league,
+        CurrencyPairKey pair,
+        out ExchangePairSnapshot? snapshot)
     {
-        return _latestByPair.TryGetValue(pair, out snapshot);
+        return _latestByPair.TryGetValue(
+            new LeagueCurrencyPairKey(
+                league,
+                pair.OfferedMetadata,
+                pair.WantedMetadata),
+            out snapshot);
+    }
+
+    public int CountFreshMarketQuotes(
+        string league,
+        DateTimeOffset now,
+        TimeSpan maximumAge)
+    {
+        if (string.IsNullOrWhiteSpace(league) || maximumAge < TimeSpan.Zero)
+        {
+            return 0;
+        }
+
+        var oldestAllowed = now - maximumAge;
+        return _latestByPair.Values.Count(
+            snapshot => string.Equals(snapshot.League, league, StringComparison.Ordinal) &&
+                snapshot.CapturedAtUtc >= oldestAllowed &&
+                snapshot.CapturedAtUtc <= now &&
+                snapshot.MarketRate != null);
     }
 
     public void Clear()
     {
         _latestByPair.Clear();
     }
+
 }

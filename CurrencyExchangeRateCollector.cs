@@ -17,6 +17,15 @@ public sealed class CurrencyExchangeRateCollector
             return false;
         }
 
+        var serverData = gameController.Game.IngameState.ServerData;
+        var league = serverData.League;
+        if (string.IsNullOrWhiteSpace(league))
+        {
+            snapshot = null;
+            failureReason = "Current league is unavailable; capture was not created.";
+            return false;
+        }
+
         var offeredItem = panel.OfferedItemType;
         var wantedItem = panel.WantedItemType;
         if (offeredItem == null || wantedItem == null ||
@@ -48,7 +57,10 @@ public sealed class CurrencyExchangeRateCollector
             stock => stock.ListedCount);
 
         snapshot = new ExchangePairSnapshot(
+            Guid.NewGuid(),
             DateTimeOffset.UtcNow,
+            league,
+            serverData.InstanceId,
             new CurrencyIdentity(offeredItem.Metadata, offeredItem.Hash, offeredItem.BaseName),
             new CurrencyIdentity(wantedItem.Metadata, wantedItem.Hash, wantedItem.BaseName),
             marketRate,

@@ -18,8 +18,24 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
     private readonly CalibratedPickerOpenController _pickerOpenController = new();
     private readonly SinglePairScanController _singlePairScanController = new();
     private readonly BoundedScanController _boundedScanController = new();
+    private readonly LiquidityDiscoveryController _liquidityDiscoveryController = new();
+    private readonly CurrencyDiscoveryProbeStore _discoveryProbeStore = new();
+    private readonly CurrencyDiscoveryOverrideStore _discoveryOverrideStore = new();
     private readonly ExchangeRateBook _rateBook = new();
     private readonly RateCaptureJsonExporter _exporter = new();
+    private readonly ActiveMarketDiscoveryExporter _marketDiscoveryExporter = new();
+    private readonly CurrencyConversionGraphExporter _conversionGraphExporter = new();
+    private readonly Guid _collectorSessionId = Guid.NewGuid();
+    private long _lastAttemptedBoundedScanRevision = -1;
+    private long _lastPersistedBoundedScanRevision = -1;
+    private DateTimeOffset _nextBoundedScanManifestRetryUtc;
+    private bool _marketDiscoveryDirty;
+    private DateTimeOffset _nextMarketDiscoveryRetryUtc;
+    private bool _conversionGraphDirty;
+    private DateTimeOffset _nextConversionGraphRetryUtc;
+    private DateTimeOffset _nextConversionGraphExpirationUtc = DateTimeOffset.MaxValue;
+    private int _lastConversionGraphMaximumAgeMinutes = -1;
+    private DateTimeOffset _nextDiscoveryCatalogueAttemptUtc;
     private CurrencyCatalogue? _catalogue;
     private CurrencyScanPlan? _scanPlan;
     private CurrencyScanPlanStep? _previewStep;
@@ -27,7 +43,17 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
     private string _captureStatus = "Use the capture hotkey with an exchange pair selected.";
     private string _exportPath = "";
     private string _pickerButtonCalibrationPath = "";
+    private string _marketDiscoveryPath = "";
+    private string _conversionGraphPath = "";
+    private string _discoveryProbePath = "";
+    private string _discoveryProbeLeague = "";
+    private Dictionary<CurrencyPairKey, CurrencyDiscoveryProbeOutcome> _discoveryProbeOutcomes = [];
+    private string _discoveryOverridePath = "";
+    private string _discoveryOverrideLeague = "";
+    private CurrencyDiscoveryOverrides _discoveryOverrides = CurrencyDiscoveryOverrides.Empty;
     private string _exportStatus = "";
+    private string _marketDiscoveryStatus = "Active-market discovery is waiting for the live catalogue.";
+    private string _conversionGraphStatus = "Conversion graph is waiting for the live catalogue.";
     private string _scanStatus = "Press F7 to build and preview the next scan step.";
     private string _inputStatus = "Search focus input is disabled by default.";
 
@@ -41,16 +67,32 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         Settings.OpenNextPlannedPicker.IgnoreFocusedInput = true;
         Settings.RunSinglePairAutomation.IgnoreFocusedInput = true;
         Settings.RunBoundedScanAutomation.IgnoreFocusedInput = true;
+        Settings.RunLiquidityDiscoveryAutomation.IgnoreFocusedInput = true;
         _exportPath = Path.Combine(ConfigDirectory, "FaustusController_rate-captures.json");
         _pickerButtonCalibrationPath = Path.Combine(
             ConfigDirectory,
             "FaustusController_picker-buttons.json");
+        _marketDiscoveryPath = Path.Combine(
+            ConfigDirectory,
+            "FaustusController_active-markets.json");
+        _conversionGraphPath = Path.Combine(
+            ConfigDirectory,
+            "FaustusController_conversion-graph.json");
         if (File.Exists(_exportPath))
         {
             try
             {
-                var exportedCount = _exporter.Export([], _exportPath);
-                _exportStatus = $"Validated {exportedCount} exported pairs at {_exportPath}";
+                var exportResult = _exporter.Export(
+                    [],
+                    _exportPath,
+                    activeCollectorSessionId: _collectorSessionId);
+                foreach (var snapshot in _exporter.LoadSnapshots(_exportPath))
+                {
+                    _rateBook.Store(snapshot);
+                }
+
+                _exportStatus = $"Validated schema-v4 latest captures: " +
+                    $"{exportResult.CaptureCount} league/pair captures loaded at {_exportPath}";
             }
             catch (Exception exception)
             {
@@ -91,13 +133,20 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         _pickerOpenController.Cancel("Picker-open operation cancelled after area change.");
         _singlePairScanController.Cancel("Single-pair scan cancelled after area change.");
         _boundedScanController.Cancel("Bounded scan cancelled after area change.");
+        _liquidityDiscoveryController.Cancel("Liquidity discovery cancelled after area change.");
         _searchQueryController.Cancel("Search query cancelled after area change.");
+        _marketDiscoveryDirty = true;
+        _nextMarketDiscoveryRetryUtc = DateTimeOffset.UtcNow;
+        _conversionGraphDirty = true;
+        _nextConversionGraphRetryUtc = DateTimeOffset.UtcNow;
         _captureStatus = "Area changed; captured rate snapshots were retained.";
         _scanStatus = "Dry-run preview cleared after area change.";
     }
 
     public override Job Tick()
     {
+        EnsureMarketDiscoveryCatalogue();
+
         if (Settings.CaptureCurrentRate.PressedOnce())
         {
             if (IsAnyAutomationRunning)
@@ -111,27 +160,37 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
                     out var snapshot,
                     out var failureReason))
                 {
-                    _rateBook.Store(snapshot!);
-                    var immediateStock = snapshot!.TopImmediateStock;
+                    var contextualSnapshot = AttachCaptureContext(
+                        snapshot!,
+                        ExchangeCaptureSource.Manual);
+                    _rateBook.Store(contextualSnapshot);
+                    var immediateStock = contextualSnapshot.TopImmediateStock;
                     var rawImmediate = immediateStock == null
                         ? ""
                         : $" (raw wanted {immediateStock.RawGet}:{immediateStock.RawGive})";
-                    var competingStock = snapshot.TopCompetingStock;
+                    var competingStock = contextualSnapshot.TopCompetingStock;
                     var rawCompeting = competingStock == null
                         ? ""
                         : $" (raw opposite {competingStock.RawGet}:{competingStock.RawGive})";
-                    _captureStatus = $"Captured {snapshot!.OfferedCurrency.Name} -> " +
-                        $"{snapshot.WantedCurrency.Name}. Market: " +
-                        $"{FormatRatio(snapshot.MarketRate)}; immediate: " +
-                        $"{FormatRatio(snapshot.TopImmediateRate)}{rawImmediate}; " +
-                        $"competing: {FormatRatio(snapshot.TopCompetingRate)}{rawCompeting}.";
+                    _captureStatus = $"Captured {contextualSnapshot.OfferedCurrency.Name} -> " +
+                        $"{contextualSnapshot.WantedCurrency.Name} in " +
+                        $"{contextualSnapshot.League}. Market: " +
+                        $"{FormatRatio(contextualSnapshot.MarketRate)}; immediate: " +
+                        $"{FormatRatio(contextualSnapshot.TopImmediateRate)}{rawImmediate}; " +
+                        $"competing: {FormatRatio(contextualSnapshot.TopCompetingRate)}{rawCompeting}.";
 
                     try
                     {
-                        var exportedCount = _exporter.Export(
+                        var exportResult = _exporter.Export(
                             _rateBook.LatestSnapshots,
-                            _exportPath);
-                        _exportStatus = $"Exported {exportedCount} pairs to {_exportPath}";
+                            _exportPath,
+                            activeCollectorSessionId: _collectorSessionId);
+                        _exportStatus = FormatExportStatus(exportResult);
+                        if (!RefreshMarketDiscovery())
+                        {
+                            _captureStatus +=
+                                " Active-market regeneration failed and will retry.";
+                        }
                     }
                     catch (Exception exception)
                     {
@@ -153,6 +212,11 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         if (Settings.RunBoundedScanAutomation.PressedOnce())
         {
             ToggleBoundedScanAutomation();
+        }
+
+        if (Settings.RunLiquidityDiscoveryAutomation.PressedOnce())
+        {
+            ToggleLiquidityDiscoveryAutomation();
         }
 
         if (Settings.RunSinglePairAutomation.PressedOnce())
@@ -205,6 +269,13 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         {
             CancelBoundedScanAutomation(
                 "Bounded scan cancelled: one or more required permission toggles were disabled.");
+        }
+
+        if (_liquidityDiscoveryController.IsRunning &&
+            !AreLiquidityDiscoveryPermissionsEnabled())
+        {
+            CancelLiquidityDiscovery(
+                "Liquidity discovery cancelled: one or more required permission toggles were disabled.");
         }
 
         if (_catalogue != null)
@@ -283,7 +354,14 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         var automatedSnapshot = _singlePairScanController.TakeCapturedSnapshot();
         if (automatedSnapshot != null)
         {
-            StoreAndExportAutomatedSnapshot(automatedSnapshot, "Single-pair");
+            if (!StoreAndExportAutomatedSnapshot(
+                automatedSnapshot,
+                ExchangeCaptureSource.SinglePairAutomation,
+                "Single-pair"))
+            {
+                _singlePairScanController.Cancel(
+                    "Single-pair capture persistence failed; no retry sent.");
+            }
         }
 
         var boundedScanWasRunning = _boundedScanController.IsRunning;
@@ -311,7 +389,11 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         var boundedSnapshot = _boundedScanController.PendingSnapshot;
         if (boundedSnapshot != null)
         {
-            if (StoreAndExportAutomatedSnapshot(boundedSnapshot, "Bounded scan"))
+            if (StoreAndExportAutomatedSnapshot(
+                boundedSnapshot,
+                ExchangeCaptureSource.BoundedScanAutomation,
+                "Bounded scan",
+                _boundedScanController.GetProgress()))
             {
                 if (!_boundedScanController.ConfirmSnapshotPersisted(out var confirmationFailure))
                 {
@@ -332,13 +414,72 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             }
         }
 
+        if (_catalogue != null)
+        {
+            _liquidityDiscoveryController.Tick(
+                GameController,
+                _catalogue,
+                _pickerButtonCalibration,
+                _pickerOpenController,
+                _pickerInspector,
+                _searchQueryController,
+                _cursorTweenController,
+                _selectionController,
+                _collector,
+                Settings.CursorTweenSpeed.Value);
+        }
+
+        var pendingProbe = _liquidityDiscoveryController.PendingProbe;
+        if (pendingProbe != null && TryPersistDiscoveryProbe(pendingProbe))
+        {
+            if (!_liquidityDiscoveryController.ConfirmProbePersisted(out var probeFailure))
+            {
+                CancelLiquidityDiscovery(probeFailure);
+            }
+        }
+
+        PersistBoundedScanProgressIfChanged();
+        if (_marketDiscoveryDirty && _catalogue != null &&
+            DateTimeOffset.UtcNow >= _nextMarketDiscoveryRetryUtc)
+        {
+            _ = RefreshMarketDiscovery();
+        }
+
+        if (_catalogue != null &&
+            !_conversionGraphDirty &&
+            _lastConversionGraphMaximumAgeMinutes != Settings.MaximumQuoteAgeMinutes.Value)
+        {
+            _conversionGraphDirty = true;
+            _nextConversionGraphRetryUtc = DateTimeOffset.UtcNow;
+        }
+
+        if (!_conversionGraphDirty && _catalogue != null &&
+            DateTimeOffset.UtcNow >= _nextConversionGraphExpirationUtc)
+        {
+            _conversionGraphDirty = true;
+            _nextConversionGraphRetryUtc = DateTimeOffset.UtcNow;
+        }
+
+        if (_conversionGraphDirty && _catalogue != null &&
+            DateTimeOffset.UtcNow >= _nextConversionGraphRetryUtc)
+        {
+            _ = RefreshConversionGraph();
+        }
+
         return null!;
     }
 
     private void StartDryRunPreview()
     {
+        if (_liquidityDiscoveryController.IsRunning)
+        {
+            _inputStatus = "F7 preview blocked: liquidity discovery is running.";
+            return;
+        }
+
         CancelSinglePairAutomation("Single-pair scan cancelled by a new preview.");
         CancelBoundedScanAutomation("Bounded scan cancelled by a new preview.");
+        CancelLiquidityDiscovery("Liquidity discovery cancelled by a new preview.");
         _searchQueryController.Cancel("Search query cancelled by a new scan preview.");
         _cursorTweenController.Cancel("Cursor tween cancelled by a new scan preview.");
         _selectionController.Cancel("Option selection cancelled by a new scan preview.");
@@ -357,6 +498,8 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             return;
         }
 
+        EnsureDiscoveryProbeRegistry();
+
         _previewStep = _scanPlan!.InitialCollectionSteps.FirstOrDefault();
         if (_previewStep == null)
         {
@@ -365,6 +508,7 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         }
 
         _scanStatus = FormatScanStep(_previewStep);
+        _ = RefreshMarketDiscovery();
     }
 
     private void UpdateDryRunTarget()
@@ -580,6 +724,7 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             desiredCurrency,
             isPickingWantedCurrency,
             Settings.EnterPickerSearchQuery.Value.Key,
+            _catalogue,
             out _);
     }
 
@@ -735,8 +880,15 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
 
     private void StartPickerButtonCalibration()
     {
+        if (_liquidityDiscoveryController.IsRunning)
+        {
+            _inputStatus = "F12 calibration blocked: liquidity discovery is running.";
+            return;
+        }
+
         CancelSinglePairAutomation("Single-pair scan cancelled by calibration.");
         CancelBoundedScanAutomation("Bounded scan cancelled by calibration.");
+        CancelLiquidityDiscovery("Liquidity discovery cancelled by calibration.");
         _searchQueryController.Cancel("Search query cancelled by picker-button calibration.");
         _cursorTweenController.Cancel("Cursor tween cancelled by picker-button calibration.");
         _selectionController.Cancel("Option selection cancelled by picker-button calibration.");
@@ -821,10 +973,10 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
 
     private void StartSinglePairAutomation()
     {
-        if (_boundedScanController.IsRunning)
+        if (_boundedScanController.IsRunning || _liquidityDiscoveryController.IsRunning)
         {
             _singlePairScanController.Cancel(
-                "Single-pair scan blocked: bounded scan is running.");
+                "Single-pair scan blocked: another automated scan is running.");
             return;
         }
 
@@ -881,35 +1033,42 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
 
         if (!Settings.AllowBoundedScanAutomation)
         {
-            _boundedScanController.Cancel(
+            _boundedScanController.Block(
                 "Bounded scan blocked: enable Allow Bounded Scan Automation first.");
             return;
         }
 
         if (!AreBoundedScanPermissionsEnabled())
         {
-            _boundedScanController.Cancel(
+            _boundedScanController.Block(
                 "Bounded scan blocked: enable all picker, query, movement, and click permissions.");
             return;
         }
 
         if (_singlePairScanController.IsRunning)
         {
-            _boundedScanController.Cancel(
+            _boundedScanController.Block(
                 "Bounded scan blocked: single-pair scan is running.");
+            return;
+        }
+
+        if (_liquidityDiscoveryController.IsRunning)
+        {
+            _boundedScanController.Block(
+                "Bounded scan blocked: liquidity discovery is running.");
             return;
         }
 
         if (_previewStep == null || _catalogue == null || _scanPlan == null)
         {
-            _boundedScanController.Cancel(
+            _boundedScanController.Block(
                 "Bounded scan blocked: press F7 to create an initial-scope preview first.");
             return;
         }
 
         if (!_pickerButtonCalibration.IsComplete)
         {
-            _boundedScanController.Cancel(
+            _boundedScanController.Block(
                 "Bounded scan blocked: complete F12 calibration first.");
             return;
         }
@@ -917,7 +1076,7 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         if (_pickerOpenController.IsRunning || _searchQueryController.IsRunning ||
             _cursorTweenController.IsRunning || _selectionController.IsRunning)
         {
-            _boundedScanController.Cancel(
+            _boundedScanController.Block(
                 "Bounded scan blocked: another input operation is running.");
             return;
         }
@@ -926,12 +1085,96 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         _searchQueryController.Cancel("Query controller reset for bounded scan.");
         _cursorTweenController.Cancel("Cursor tween reset for bounded scan.");
         _selectionController.Cancel("Selection controller reset for bounded scan.");
-        _boundedScanController.Start(
+        if (_boundedScanController.Start(
             GameController,
             _scanPlan.InitialCollectionSteps,
             _previewStep,
             Settings.PairsPerBoundedScan.Value,
-            out _);
+            _collectorSessionId,
+            out _))
+        {
+            PersistBoundedScanProgressIfChanged();
+        }
+    }
+
+    private void ToggleLiquidityDiscoveryAutomation()
+    {
+        if (_liquidityDiscoveryController.IsRunning)
+        {
+            CancelLiquidityDiscovery("Liquidity discovery cancelled by F2; no retry sent.");
+            return;
+        }
+
+        if (!Settings.AllowLiquidityDiscoveryAutomation)
+        {
+            _liquidityDiscoveryController.Block(
+                "Liquidity discovery blocked: enable Allow Liquidity Discovery Automation first.");
+            return;
+        }
+
+        if (!AreLiquidityDiscoveryPermissionsEnabled())
+        {
+            _liquidityDiscoveryController.Block(
+                "Liquidity discovery blocked: enable all picker, query, movement, and click permissions.");
+            return;
+        }
+
+        if (_singlePairScanController.IsRunning || _boundedScanController.IsRunning)
+        {
+            _liquidityDiscoveryController.Block(
+                "Liquidity discovery blocked: another automated scan is running.");
+            return;
+        }
+
+        if (_catalogue == null)
+        {
+            _liquidityDiscoveryController.Block(
+                "Liquidity discovery blocked: the live catalogue is not available yet.");
+            return;
+        }
+
+        if (_scanPlan == null &&
+            !CurrencyScanPlan.TryCreate(_catalogue, out _scanPlan, out var planFailure))
+        {
+            _liquidityDiscoveryController.Block(
+                $"Liquidity discovery blocked: {planFailure}");
+            return;
+        }
+
+        if (!_pickerButtonCalibration.IsComplete)
+        {
+            _liquidityDiscoveryController.Block(
+                "Liquidity discovery blocked: complete F12 calibration first.");
+            return;
+        }
+
+        if (_pickerOpenController.IsRunning || _searchQueryController.IsRunning ||
+            _cursorTweenController.IsRunning || _selectionController.IsRunning)
+        {
+            _liquidityDiscoveryController.Block(
+                "Liquidity discovery blocked: another input operation is running.");
+            return;
+        }
+
+        if (!EnsureDiscoveryOverrides(forceReload: true) ||
+            !EnsureDiscoveryProbeRegistry())
+        {
+            _liquidityDiscoveryController.Block(
+                "Liquidity discovery blocked: probe registry or manual overrides could not be loaded.");
+            return;
+        }
+
+        var plan = GetLiquidityDiscoveryRunPlan();
+
+        _pickerOpenController.Cancel("Picker opener reset for liquidity discovery.");
+        _searchQueryController.Cancel("Query controller reset for liquidity discovery.");
+        _cursorTweenController.Cancel("Cursor tween reset for liquidity discovery.");
+        _selectionController.Cancel("Selection controller reset for liquidity discovery.");
+        _liquidityDiscoveryController.Start(
+            GameController,
+            plan.Steps,
+            out _,
+            plan.Label);
     }
 
     private bool AreSinglePairPermissionsEnabled()
@@ -952,8 +1195,19 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             Settings.AllowVerifiedOptionClick;
     }
 
+    private bool AreLiquidityDiscoveryPermissionsEnabled()
+    {
+        return Settings.AllowLiquidityDiscoveryAutomation &&
+            Settings.AllowCalibratedPickerOpen &&
+            Settings.AllowSearchQueryInput &&
+            Settings.AllowVerifiedTargetMouseMove &&
+            Settings.AllowVerifiedOptionClick;
+    }
+
     private bool IsAnyAutomationRunning =>
-        _singlePairScanController.IsRunning || _boundedScanController.IsRunning;
+        _singlePairScanController.IsRunning ||
+        _boundedScanController.IsRunning ||
+        _liquidityDiscoveryController.IsRunning;
 
     private void CancelSinglePairAutomation(string reason)
     {
@@ -977,6 +1231,17 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         CancelSharedInputControllers(reason);
     }
 
+    private void CancelLiquidityDiscovery(string reason)
+    {
+        if (!_liquidityDiscoveryController.IsRunning)
+        {
+            return;
+        }
+
+        _liquidityDiscoveryController.Cancel(reason);
+        CancelSharedInputControllers(reason);
+    }
+
     private void CancelSharedInputControllers(string reason)
     {
         _pickerOpenController.Cancel(reason);
@@ -987,23 +1252,659 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
 
     private bool StoreAndExportAutomatedSnapshot(
         ExchangePairSnapshot snapshot,
-        string source)
+        ExchangeCaptureSource captureSource,
+        string sourceLabel,
+        BoundedScanProgress? boundedScanProgress = null)
     {
-        _rateBook.Store(snapshot);
-        _captureStatus = $"{source} capture {snapshot.OfferedCurrency.Name} -> " +
-            $"{snapshot.WantedCurrency.Name}: {FormatRatio(snapshot.MarketRate)}.";
+        var contextualSnapshot = AttachCaptureContext(snapshot, captureSource);
+        _rateBook.Store(contextualSnapshot);
+        _captureStatus = $"{sourceLabel} capture " +
+            $"{contextualSnapshot.OfferedCurrency.Name} -> " +
+            $"{contextualSnapshot.WantedCurrency.Name} in {contextualSnapshot.League}: " +
+            $"{FormatRatio(contextualSnapshot.MarketRate)}.";
         try
         {
-            var exportedCount = _exporter.Export(
+            if (boundedScanProgress != null)
+            {
+                _lastAttemptedBoundedScanRevision = _boundedScanController.Revision;
+                _nextBoundedScanManifestRetryUtc = DateTimeOffset.UtcNow +
+                    TimeSpan.FromSeconds(2);
+            }
+
+            var exportResult = _exporter.Export(
                 _rateBook.LatestSnapshots,
-                _exportPath);
-            _exportStatus = $"Exported {exportedCount} pairs to {_exportPath}";
-            return true;
+                _exportPath,
+                boundedScanProgress,
+                _collectorSessionId);
+            if (boundedScanProgress != null)
+            {
+                _lastPersistedBoundedScanRevision = _boundedScanController.Revision;
+            }
+
+            _exportStatus = FormatExportStatus(exportResult);
+            return RefreshMarketDiscovery();
         }
         catch (Exception exception)
         {
             _exportStatus = $"Rate export failed: {exception.Message}";
             return false;
+        }
+    }
+
+    private void PersistBoundedScanProgressIfChanged()
+    {
+        var progress = _boundedScanController.GetProgress();
+        var revision = _boundedScanController.Revision;
+        if (progress == null || revision == _lastPersistedBoundedScanRevision ||
+            (revision == _lastAttemptedBoundedScanRevision &&
+                DateTimeOffset.UtcNow < _nextBoundedScanManifestRetryUtc))
+        {
+            return;
+        }
+
+        _lastAttemptedBoundedScanRevision = revision;
+        _nextBoundedScanManifestRetryUtc = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(2);
+        try
+        {
+            var exportResult = _exporter.Export(
+                _rateBook.LatestSnapshots,
+                _exportPath,
+                progress,
+                _collectorSessionId);
+            _lastPersistedBoundedScanRevision = revision;
+            _exportStatus = FormatExportStatus(exportResult);
+            _conversionGraphDirty = true;
+            _nextConversionGraphRetryUtc = DateTimeOffset.UtcNow;
+        }
+        catch (Exception exception)
+        {
+            _exportStatus = $"Scan manifest export failed: {exception.Message}";
+            if (_boundedScanController.State != BoundedScanState.Faulted)
+            {
+                var reason = "Bounded scan faulted because its manifest could not be persisted.";
+                _boundedScanController.FailPersistence(reason);
+                CancelSharedInputControllers(reason);
+                PersistBoundedScanProgressIfChanged();
+            }
+        }
+    }
+
+    private ExchangePairSnapshot AttachCaptureContext(
+        ExchangePairSnapshot snapshot,
+        ExchangeCaptureSource source)
+    {
+        return snapshot with
+        {
+            CollectorSessionId = _collectorSessionId,
+            Source = source
+        };
+    }
+
+    private string FormatExportStatus(RateCaptureExportResult result)
+    {
+        return $"Exported {result.CaptureCount} latest league/pair captures to {_exportPath}";
+    }
+
+    private bool RefreshMarketDiscovery()
+    {
+        if (_catalogue == null)
+        {
+            _marketDiscoveryDirty = true;
+            return true;
+        }
+
+        var league = GetCurrentLeague();
+        if (string.IsNullOrWhiteSpace(league))
+        {
+            _marketDiscoveryStatus = "Active-market discovery blocked: current league unavailable.";
+            _marketDiscoveryDirty = true;
+            _nextMarketDiscoveryRetryUtc = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(2);
+            return false;
+        }
+
+        try
+        {
+            _ = EnsureDiscoveryProbeRegistry();
+            var durableSnapshots = _exporter.LoadSnapshots(_exportPath);
+            SyncPositiveProbeOutcomes(durableSnapshots);
+            var result = _marketDiscoveryExporter.Export(
+                _catalogue,
+                durableSnapshots,
+                league,
+                TimeSpan.FromMinutes(Settings.MaximumQuoteAgeMinutes.Value),
+                _marketDiscoveryPath,
+                _discoveryProbeOutcomes.Values,
+                _discoveryOverrides.ForceSkipMetadata,
+                _discoveryOverrides.ForceIncludeMetadata);
+            _marketDiscoveryStatus = $"Discovery catalogue: " +
+                $"{result.CatalogueCurrencyCount} currencies; " +
+                $"{result.ActiveCurrencyCount} with positive evidence; " +
+                $"{result.ObservedActivePairCount}/{result.EligibleProbePairCount} " +
+                "currently eligible discovery pairs observed positive.";
+            _marketDiscoveryDirty = false;
+            _conversionGraphDirty = true;
+            _nextConversionGraphRetryUtc = DateTimeOffset.UtcNow;
+            _ = RefreshConversionGraph();
+            return true;
+        }
+        catch (Exception exception)
+        {
+            _marketDiscoveryStatus = $"Active-market export failed: {exception.Message}";
+            _marketDiscoveryDirty = true;
+            _nextMarketDiscoveryRetryUtc = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(2);
+            return false;
+        }
+    }
+
+    private bool RefreshConversionGraph()
+    {
+        if (_catalogue == null)
+        {
+            _conversionGraphDirty = true;
+            return true;
+        }
+
+        var league = GetCurrentLeague();
+        if (string.IsNullOrWhiteSpace(league))
+        {
+            _conversionGraphStatus = "Conversion graph blocked: current league unavailable.";
+            _conversionGraphDirty = true;
+            _nextConversionGraphRetryUtc = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(2);
+            return false;
+        }
+
+        try
+        {
+            if (!EnsureDiscoveryProbeRegistry())
+            {
+                throw new InvalidOperationException(
+                    "Discovery-probe registry is unavailable for graph coherence validation.");
+            }
+
+            LatestBoundedScanManifest? completedManifest = null;
+            var ignoredManifestFailure = "";
+            try
+            {
+                completedManifest = _exporter.LoadLatestCompletedBoundedScan(_exportPath);
+            }
+            catch (Exception exception)
+            {
+                ignoredManifestFailure = exception.Message;
+            }
+
+            var graphSnapshots = _exporter.LoadSnapshotsForGraph(_exportPath, league);
+            var result = _conversionGraphExporter.Export(
+                _catalogue,
+                graphSnapshots.Snapshots,
+                _discoveryProbeOutcomes.Values,
+                completedManifest,
+                league,
+                DateTimeOffset.UtcNow,
+                TimeSpan.FromMinutes(Settings.MaximumQuoteAgeMinutes.Value),
+                _conversionGraphPath,
+                graphSnapshots.ExcludedMalformedCount,
+                _discoveryOverrides.ForceSkipMetadata);
+            _conversionGraphStatus = $"Conversion graph: {result.VertexCount} vertices; " +
+                $"{result.EdgeCount} coherent fresh directed edges; " +
+                $"{result.ExcludedStaleCount} stale and " +
+                $"{result.ExcludedIncoherentCount} incoherent captures excluded." +
+                (ignoredManifestFailure.Length == 0
+                    ? ""
+                    : $" Invalid completed-manifest provenance was ignored: " +
+                        ignoredManifestFailure);
+            _conversionGraphDirty = false;
+            _lastConversionGraphMaximumAgeMinutes =
+                Settings.MaximumQuoteAgeMinutes.Value;
+            _nextConversionGraphExpirationUtc =
+                result.NextExpirationAtUtc ?? DateTimeOffset.MaxValue;
+            return true;
+        }
+        catch (Exception exception)
+        {
+            _conversionGraphStatus = $"Conversion graph export failed: {exception.Message}";
+            _conversionGraphDirty = true;
+            _nextConversionGraphRetryUtc = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(2);
+            return false;
+        }
+    }
+
+    private IReadOnlyList<CurrencyScanPlanStep> GetEligibleLiquidityDiscoverySteps(
+        IReadOnlyDictionary<CurrencyPairKey, CurrencyDiscoveryProbeOutcome>? outcomes = null,
+        CurrencyDiscoveryOverrides? overrides = null)
+    {
+        if (_scanPlan == null)
+        {
+            return [];
+        }
+
+        outcomes ??= _discoveryProbeOutcomes;
+        overrides ??= _discoveryOverrides;
+        var phaseOne = _scanPlan.InitialCollectionSteps
+            .Where(step => !IsManuallySkipped(step, overrides))
+            .ToArray();
+        var phaseOneComplete = phaseOne.All(step =>
+            outcomes.TryGetValue(step.Pair, out var outcome) &&
+            outcome.Status is CurrencyDiscoveryProbeStatus.Active or
+                CurrencyDiscoveryProbeStatus.NoMarketRate or
+                CurrencyDiscoveryProbeStatus.Unavailable);
+        if (!phaseOneComplete)
+        {
+            return phaseOne;
+        }
+
+        var stepsByPair = _scanPlan.Steps.ToDictionary(step => step.Pair);
+        var phaseOnePairs = phaseOne.Select(step => step.Pair).ToHashSet();
+        var reverseSteps = phaseOne
+            .Where(step => outcomes.TryGetValue(step.Pair, out var outcome) &&
+                outcome.Status == CurrencyDiscoveryProbeStatus.Active ||
+                IsManuallyIncluded(step, overrides) ||
+                outcomes.TryGetValue(
+                    new CurrencyPairKey(
+                        step.WantedCurrency.Metadata,
+                        step.OfferedCurrency.Metadata),
+                    out var reverseOutcome) &&
+                reverseOutcome.Status == CurrencyDiscoveryProbeStatus.Active)
+            .Select(step => new CurrencyPairKey(
+                step.WantedCurrency.Metadata,
+                step.OfferedCurrency.Metadata))
+            .Where(pair => !phaseOnePairs.Contains(pair))
+            .Distinct()
+            .Select(pair => stepsByPair[pair])
+            .OrderBy(step => step.Index);
+        return phaseOne.Concat(reverseSteps).ToArray();
+    }
+
+    private LiquidityDiscoveryRunPlan GetLiquidityDiscoveryRunPlan()
+    {
+        var eligible = GetEligibleLiquidityDiscoverySteps();
+        var unresolved = eligible
+            .Where(step => !_discoveryProbeOutcomes.TryGetValue(step.Pair, out var outcome) ||
+                outcome.Status == CurrencyDiscoveryProbeStatus.Failed)
+            .ToArray();
+        if (unresolved.Length > 0)
+        {
+            var phaseOnePairs = _scanPlan!.InitialCollectionSteps
+                .Where(step => !IsManuallySkipped(step))
+                .Select(step => step.Pair)
+                .ToHashSet();
+            var label = unresolved.Any(step => phaseOnePairs.Contains(step.Pair))
+                ? "Full initial discovery"
+                : "Active-candidate reverse discovery";
+            return new LiquidityDiscoveryRunPlan(label, unresolved);
+        }
+
+        var activeRefresh = eligible
+            .Where(step => IsManuallyIncluded(step) ||
+                _discoveryProbeOutcomes.TryGetValue(step.Pair, out var outcome) &&
+                outcome.Status == CurrencyDiscoveryProbeStatus.Active)
+            .ToArray();
+        return new LiquidityDiscoveryRunPlan("Active listing refresh", activeRefresh);
+    }
+
+    private bool IsManuallyIncluded(
+        CurrencyScanPlanStep step,
+        CurrencyDiscoveryOverrides? overrides = null)
+    {
+        overrides ??= _discoveryOverrides;
+        return overrides.ForceIncludeMetadata.Contains(
+                step.OfferedCurrency.Metadata) ||
+            overrides.ForceIncludeMetadata.Contains(
+                step.WantedCurrency.Metadata);
+    }
+
+    private bool IsManuallySkipped(
+        CurrencyScanPlanStep step,
+        CurrencyDiscoveryOverrides? overrides = null)
+    {
+        overrides ??= _discoveryOverrides;
+        return overrides.ForceSkipMetadata.Contains(
+                step.OfferedCurrency.Metadata) ||
+            overrides.ForceSkipMetadata.Contains(
+                step.WantedCurrency.Metadata);
+    }
+
+    private readonly record struct LiquidityDiscoveryRunPlan(
+        string Label,
+        IReadOnlyList<CurrencyScanPlanStep> Steps);
+
+    private void SyncPositiveProbeOutcomes(
+        IReadOnlyCollection<ExchangePairSnapshot> snapshots)
+    {
+        if (_catalogue == null || _scanPlan == null ||
+            string.IsNullOrWhiteSpace(_discoveryProbeLeague))
+        {
+            return;
+        }
+
+        var eligiblePairs = GetEligibleLiquidityDiscoverySteps()
+            .Select(step => step.Pair)
+            .ToHashSet();
+        var updated = new Dictionary<CurrencyPairKey, CurrencyDiscoveryProbeOutcome>(
+            _discoveryProbeOutcomes);
+        var changed = false;
+        foreach (var snapshot in snapshots)
+        {
+            if (!string.Equals(
+                    snapshot.League,
+                    _discoveryProbeLeague,
+                    StringComparison.Ordinal) ||
+                snapshot.MarketRate == null ||
+                !eligiblePairs.Contains(snapshot.Pair) ||
+                updated.TryGetValue(snapshot.Pair, out var existing) &&
+                    existing.ObservedAtUtc >= snapshot.CapturedAtUtc)
+            {
+                continue;
+            }
+
+            updated[snapshot.Pair] = new CurrencyDiscoveryProbeOutcome(
+                _discoveryProbeLeague,
+                snapshot.OfferedCurrency,
+                snapshot.WantedCurrency,
+                CurrencyDiscoveryProbeStatus.Active,
+                snapshot.CapturedAtUtc,
+                snapshot.ScanId ?? snapshot.CaptureId,
+                snapshot.ScanSequence ?? 1,
+                snapshot.CaptureId,
+                null);
+            changed = true;
+        }
+
+        if (!changed)
+        {
+            return;
+        }
+
+        _discoveryProbeStore.Save(
+            updated.Values.ToArray(),
+            _discoveryProbeLeague,
+            _catalogue.Items.Count,
+            GetEligibleLiquidityDiscoverySteps(updated).Count,
+            _discoveryProbePath);
+        _discoveryProbeOutcomes = updated;
+    }
+
+    private bool EnsureDiscoveryProbeRegistry()
+    {
+        if (_catalogue == null)
+        {
+            return false;
+        }
+
+        var league = GetCurrentLeague();
+        if (string.IsNullOrWhiteSpace(league))
+        {
+            return false;
+        }
+
+        if (!EnsureDiscoveryOverrides())
+        {
+            return false;
+        }
+
+        if (string.Equals(_discoveryProbeLeague, league, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        try
+        {
+            _discoveryProbePath = GetDiscoveryProbePath(league);
+            if (_scanPlan == null &&
+                !CurrencyScanPlan.TryCreate(_catalogue, out _scanPlan, out _))
+            {
+                return false;
+            }
+
+            var loaded = _discoveryProbeStore.Load(_discoveryProbePath, league);
+            var outcomes = loaded.ToDictionary(outcome => outcome.Pair);
+            var eligiblePairs = GetEligibleLiquidityDiscoverySteps(outcomes)
+                .Select(step => step.Pair)
+                .ToHashSet();
+            foreach (var snapshot in _exporter
+                .LoadSnapshotsForGraph(_exportPath, league)
+                .Snapshots)
+            {
+                if (!string.Equals(snapshot.League, league, StringComparison.Ordinal) ||
+                    snapshot.MarketRate == null ||
+                    !eligiblePairs.Contains(snapshot.Pair) ||
+                    outcomes.ContainsKey(snapshot.Pair))
+                {
+                    continue;
+                }
+
+                outcomes[snapshot.Pair] = new CurrencyDiscoveryProbeOutcome(
+                    league,
+                    snapshot.OfferedCurrency,
+                    snapshot.WantedCurrency,
+                    CurrencyDiscoveryProbeStatus.Active,
+                    snapshot.CapturedAtUtc,
+                    snapshot.ScanId ?? snapshot.CaptureId,
+                    snapshot.ScanSequence ?? 1,
+                    snapshot.CaptureId,
+                    null);
+            }
+
+            _discoveryProbeStore.Save(
+                outcomes.Values.ToArray(),
+                league,
+                _catalogue.Items.Count,
+                GetEligibleLiquidityDiscoverySteps(outcomes).Count,
+                _discoveryProbePath);
+            _discoveryProbeOutcomes = outcomes;
+            _discoveryProbeLeague = league;
+            return true;
+        }
+        catch (Exception exception)
+        {
+            _marketDiscoveryStatus = $"Discovery-probe registry failed: {exception.Message}";
+            return false;
+        }
+    }
+
+    private static string SanitizeFileName(string value)
+    {
+        var invalidCharacters = Path.GetInvalidFileNameChars().ToHashSet();
+        return string.Concat(value.Select(character =>
+            invalidCharacters.Contains(character) ? '_' : character));
+    }
+
+    private string GetDiscoveryProbePath(string league)
+    {
+        return Path.Combine(
+            ConfigDirectory,
+            $"FaustusController_discovery-probes-{SanitizeFileName(league)}.json");
+    }
+
+    private string GetDiscoveryOverridePath(string league)
+    {
+        return Path.Combine(
+            ConfigDirectory,
+            $"FaustusController_discovery-overrides-{SanitizeFileName(league)}.json");
+    }
+
+    private bool EnsureDiscoveryOverrides(bool forceReload = false)
+    {
+        if (_catalogue == null)
+        {
+            return false;
+        }
+
+        var league = GetCurrentLeague();
+        if (string.IsNullOrWhiteSpace(league))
+        {
+            return false;
+        }
+
+        if (!forceReload && string.Equals(
+            _discoveryOverrideLeague,
+            league,
+            StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        try
+        {
+            var path = GetDiscoveryOverridePath(league);
+            var loaded = _discoveryOverrideStore.LoadOrCreate(path, league, _catalogue);
+            var changed = !string.Equals(
+                    _discoveryOverrideLeague,
+                    league,
+                    StringComparison.Ordinal) ||
+                !new HashSet<string>(
+                    _discoveryOverrides.ForceIncludeMetadata,
+                    StringComparer.Ordinal)
+                    .SetEquals(loaded.ForceIncludeMetadata) ||
+                !new HashSet<string>(
+                    _discoveryOverrides.ForceSkipMetadata,
+                    StringComparer.Ordinal)
+                    .SetEquals(loaded.ForceSkipMetadata);
+            if (changed)
+            {
+                if (_scanPlan != null && string.Equals(
+                    _discoveryProbeLeague,
+                    league,
+                    StringComparison.Ordinal))
+                {
+                    _discoveryProbeStore.Save(
+                        _discoveryProbeOutcomes.Values.ToArray(),
+                        league,
+                        _catalogue.Items.Count,
+                        GetEligibleLiquidityDiscoverySteps(
+                            _discoveryProbeOutcomes,
+                            loaded).Count,
+                        _discoveryProbePath);
+                }
+
+                _marketDiscoveryDirty = true;
+                _nextMarketDiscoveryRetryUtc = DateTimeOffset.UtcNow;
+                _conversionGraphDirty = true;
+                _nextConversionGraphRetryUtc = DateTimeOffset.UtcNow;
+            }
+
+            _discoveryOverridePath = path;
+            _discoveryOverrideLeague = league;
+            _discoveryOverrides = loaded;
+
+            return true;
+        }
+        catch (Exception exception)
+        {
+            _marketDiscoveryStatus = $"Discovery overrides failed: {exception.Message}";
+            return false;
+        }
+    }
+
+    private bool TryPersistDiscoveryProbe(PendingDiscoveryProbe pendingProbe)
+    {
+        if (_catalogue == null || _scanPlan == null)
+        {
+            return false;
+        }
+
+        var pendingIsLiveLeague = string.Equals(
+            pendingProbe.League,
+            GetCurrentLeague(),
+            StringComparison.Ordinal);
+        if (pendingIsLiveLeague && !EnsureDiscoveryProbeRegistry())
+        {
+            return false;
+        }
+
+        if (pendingProbe.Status == CurrencyDiscoveryProbeStatus.Active)
+        {
+            if (pendingProbe.Snapshot == null ||
+                !StoreAndExportAutomatedSnapshot(
+                    pendingProbe.Snapshot,
+                    ExchangeCaptureSource.LiquidityDiscoveryAutomation,
+                    "Liquidity discovery"))
+            {
+                return false;
+            }
+        }
+
+        var outcome = new CurrencyDiscoveryProbeOutcome(
+            pendingProbe.League,
+            pendingProbe.Step.OfferedCurrency,
+            pendingProbe.Step.WantedCurrency,
+            pendingProbe.Status,
+            pendingProbe.ObservedAtUtc,
+            pendingProbe.RunId,
+            pendingProbe.RunSequence,
+            pendingProbe.Snapshot?.CaptureId,
+            pendingProbe.FailureReason);
+        var isCurrentRegistry = string.Equals(
+            pendingProbe.League,
+            _discoveryProbeLeague,
+            StringComparison.Ordinal);
+        var probePath = GetDiscoveryProbePath(pendingProbe.League);
+        var sourceOutcomes = isCurrentRegistry
+            ? _discoveryProbeOutcomes
+            : _discoveryProbeStore.Load(probePath, pendingProbe.League)
+                .ToDictionary(item => item.Pair);
+        var updated = new Dictionary<CurrencyPairKey, CurrencyDiscoveryProbeOutcome>(
+            sourceOutcomes)
+        {
+            [outcome.Pair] = outcome
+        };
+
+        try
+        {
+            _discoveryProbeStore.Save(
+                updated.Values.ToArray(),
+                pendingProbe.League,
+                _catalogue.Items.Count,
+                GetEligibleLiquidityDiscoverySteps(updated).Count,
+                probePath);
+            if (!isCurrentRegistry)
+            {
+                return pendingProbe.Status == CurrencyDiscoveryProbeStatus.Failed;
+            }
+
+            _discoveryProbeOutcomes = updated;
+            return pendingProbe.Status == CurrencyDiscoveryProbeStatus.Failed ||
+                RefreshMarketDiscovery();
+        }
+        catch (Exception exception)
+        {
+            _exportStatus = $"Discovery-probe persistence failed: {exception.Message}";
+            return false;
+        }
+    }
+
+    private void EnsureMarketDiscoveryCatalogue()
+    {
+        if (_catalogue != null || DateTimeOffset.UtcNow < _nextDiscoveryCatalogueAttemptUtc)
+        {
+            return;
+        }
+
+        _nextDiscoveryCatalogueAttemptUtc = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(2);
+        if (!_catalogueBuilder.TryBuild(
+            GameController,
+            out var catalogue,
+            out var failureReason))
+        {
+            _marketDiscoveryStatus = $"Active-market discovery waiting: {failureReason}";
+            return;
+        }
+
+        _catalogue = catalogue;
+        _marketDiscoveryDirty = true;
+        _conversionGraphDirty = true;
+        _ = EnsureDiscoveryProbeRegistry();
+        _ = RefreshMarketDiscovery();
+    }
+
+    private string GetCurrentLeague()
+    {
+        try
+        {
+            return GameController.Game.IngameState.ServerData.League ?? "";
+        }
+        catch
+        {
+            return "";
         }
     }
 
@@ -1025,9 +1926,16 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
 
     public override void Render()
     {
+        var currentLeague = GetCurrentLeague();
+        var freshQuoteCount = _rateBook.CountFreshMarketQuotes(
+            currentLeague,
+            DateTimeOffset.UtcNow,
+            TimeSpan.FromMinutes(Settings.MaximumQuoteAgeMinutes.Value));
         Graphics.DrawText(_captureStatus, new Vector2(100, 100), SharpDX.Color.White);
         Graphics.DrawText(
-            $"Captured pairs: {_rateBook.LatestSnapshots.Count}",
+            $"Latest captures: {_rateBook.Count}; " +
+            $"{freshQuoteCount} fresh latest market quotes in " +
+            $"{(string.IsNullOrWhiteSpace(currentLeague) ? "unknown league" : currentLeague)}",
             new Vector2(100, 120),
             SharpDX.Color.White);
         Graphics.DrawText(_exportStatus, new Vector2(100, 140), SharpDX.Color.White);
@@ -1061,6 +1969,18 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             _boundedScanController.Status,
             new Vector2(100, 320),
             SharpDX.Color.LimeGreen);
+        Graphics.DrawText(
+            _marketDiscoveryStatus,
+            new Vector2(100, 340),
+            SharpDX.Color.Yellow);
+        Graphics.DrawText(
+            _liquidityDiscoveryController.Status,
+            new Vector2(100, 360),
+            SharpDX.Color.LimeGreen);
+        Graphics.DrawText(
+            _conversionGraphStatus,
+            new Vector2(100, 380),
+            SharpDX.Color.Cyan);
 
         if (_previewTarget != null)
         {

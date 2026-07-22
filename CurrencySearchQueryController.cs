@@ -16,8 +16,17 @@ public enum CurrencySearchQueryState
     Faulted
 }
 
+public enum CurrencySearchQueryFailureKind
+{
+    None,
+    NoExactMetadataMatch,
+    Automation
+}
+
 public sealed class CurrencySearchQueryController
 {
+    private readonly record struct QueryKeyStroke(Keys Key, bool Shift);
+
     private static readonly TimeSpan FocusDelay = TimeSpan.FromMilliseconds(75);
     private static readonly TimeSpan TriggerPollDelay = TimeSpan.FromMilliseconds(10);
     private static readonly TimeSpan TriggerSettleDelay = TimeSpan.FromMilliseconds(75);
@@ -28,7 +37,7 @@ public sealed class CurrencySearchQueryController
     private static readonly TimeSpan OperationTimeout = TimeSpan.FromSeconds(6);
 
     private CurrencyIdentity? _targetCurrency;
-    private IReadOnlyList<Keys> _queryKeys = [];
+    private IReadOnlyList<QueryKeyStroke> _queryKeys = [];
     private int _queryIndex;
     private bool _isPickingWantedCurrency;
     private Keys _triggerKey;
@@ -39,6 +48,7 @@ public sealed class CurrencySearchQueryController
     public CurrencySearchQueryState State { get; private set; } = CurrencySearchQueryState.Idle;
     public string Query { get; private set; } = "";
     public string Status { get; private set; } = "Automatic query input is idle.";
+    public CurrencySearchQueryFailureKind FailureKind { get; private set; }
     public CurrencyIdentity? TargetCurrency => _targetCurrency;
     public bool ExpectedWantedPicker => _isPickingWantedCurrency;
     public CurrencyPickerOptionTarget? VerifiedTarget { get; private set; }
@@ -50,26 +60,48 @@ public sealed class CurrencySearchQueryController
         CurrencyIdentity targetCurrency,
         bool isPickingWantedCurrency,
         Keys triggerKey,
+        CurrencyCatalogue catalogue,
         out string failureReason)
     {
         return StartCore(
             targetCurrency,
             isPickingWantedCurrency,
             triggerKey,
+            catalogue,
             waitForTriggerRelease: true,
+            useQuotedFullName: false,
             out failureReason);
     }
 
     public bool StartAutomated(
         CurrencyIdentity targetCurrency,
         bool isPickingWantedCurrency,
+        CurrencyCatalogue catalogue,
         out string failureReason)
     {
         return StartCore(
             targetCurrency,
             isPickingWantedCurrency,
             Keys.None,
+            catalogue,
             waitForTriggerRelease: false,
+            useQuotedFullName: false,
+            out failureReason);
+    }
+
+    public bool StartAutomatedQuotedFullName(
+        CurrencyIdentity targetCurrency,
+        bool isPickingWantedCurrency,
+        CurrencyCatalogue catalogue,
+        out string failureReason)
+    {
+        return StartCore(
+            targetCurrency,
+            isPickingWantedCurrency,
+            Keys.None,
+            catalogue,
+            waitForTriggerRelease: false,
+            useQuotedFullName: true,
             out failureReason);
     }
 
@@ -77,7 +109,9 @@ public sealed class CurrencySearchQueryController
         CurrencyIdentity targetCurrency,
         bool isPickingWantedCurrency,
         Keys triggerKey,
+        CurrencyCatalogue catalogue,
         bool waitForTriggerRelease,
+        bool useQuotedFullName,
         out string failureReason)
     {
         if (IsRunning)
@@ -87,12 +121,16 @@ public sealed class CurrencySearchQueryController
             return false;
         }
 
-        Query = CreateSearchToken(targetCurrency.Name);
+        FailureKind = CurrencySearchQueryFailureKind.None;
+        Query = useQuotedFullName
+            ? CreateQuotedSearchQuery(targetCurrency)
+            : CreateSearchQuery(targetCurrency, catalogue);
         if ((waitForTriggerRelease && triggerKey == Keys.None) || Query.Length == 0 ||
             !TryEncodeQuery(Query, out _queryKeys))
         {
             failureReason = $"Could not create a keyboard-safe query for {targetCurrency.Name}.";
             State = CurrencySearchQueryState.Faulted;
+            FailureKind = CurrencySearchQueryFailureKind.Automation;
             Status = failureReason;
             return false;
         }
@@ -103,7 +141,12 @@ public sealed class CurrencySearchQueryController
         _triggerKey = triggerKey;
         _queryIndex = 0;
         _nextActionAtUtc = DateTimeOffset.UtcNow;
-        _operationDeadlineUtc = _nextActionAtUtc + OperationTimeout;
+        var queryDuration = TimeSpan.FromMilliseconds(
+            CharacterDelay.TotalMilliseconds * _queryKeys.Count);
+        var calculatedTimeout = TriggerSettleDelay + FocusDelay + SelectDelay +
+            queryDuration + FilterTimeout + TimeSpan.FromSeconds(1);
+        _operationDeadlineUtc = _nextActionAtUtc +
+            (calculatedTimeout > OperationTimeout ? calculatedTimeout : OperationTimeout);
         State = waitForTriggerRelease
             ? CurrencySearchQueryState.WaitForTriggerRelease
             : CurrencySearchQueryState.FocusSearch;
@@ -123,6 +166,7 @@ public sealed class CurrencySearchQueryController
     {
         State = CurrencySearchQueryState.Faulted;
         VerifiedTarget = null;
+        FailureKind = CurrencySearchQueryFailureKind.Automation;
         Status = reason;
     }
 
@@ -208,7 +252,16 @@ public sealed class CurrencySearchQueryController
                         return;
                     }
 
-                    if (!TrySendKey(_queryKeys[_queryIndex], out var keyFailure))
+                    var keyStroke = _queryKeys[_queryIndex];
+                    string keyFailure;
+                    var sent = keyStroke.Shift
+                        ? TrySendChord(
+                            gameController,
+                            Keys.ShiftKey,
+                            keyStroke.Key,
+                            out keyFailure)
+                        : TrySendKey(keyStroke.Key, out keyFailure);
+                    if (!sent)
                     {
                         Fail($"Query input failed at character {_queryIndex + 1}: {keyFailure}");
                         return;
@@ -249,7 +302,9 @@ public sealed class CurrencySearchQueryController
 
                 if (now >= _filterDeadlineUtc)
                 {
-                    Fail($"Query '{Query}' did not produce a visible exact metadata match.");
+                    Fail(
+                        $"Query '{Query}' did not produce a visible exact metadata match.",
+                        CurrencySearchQueryFailureKind.NoExactMetadataMatch);
                     return;
                 }
 
@@ -415,7 +470,79 @@ public sealed class CurrencySearchQueryController
             Input.IsKeyDown(Keys.Menu);
     }
 
-    private static string CreateSearchToken(string currencyName)
+    internal static string CreateSearchQuery(
+        CurrencyIdentity targetCurrency,
+        CurrencyCatalogue catalogue)
+    {
+        var tokens = Tokenize(targetCurrency.Name);
+        if (tokens.Count == 0)
+        {
+            return "";
+        }
+
+        var normalizedCatalogueNames = catalogue.Items
+            .Select(currency => string.Join(' ', Tokenize(currency.Name)))
+            .ToArray();
+        var candidates = new List<(string Query, int MatchCount, bool WeakBoundary)>();
+        for (var wordCount = 1; wordCount <= tokens.Count; wordCount++)
+        {
+            for (var start = 0; start + wordCount <= tokens.Count; start++)
+            {
+                if (wordCount == 1 && IsWeakStandaloneToken(tokens[start]))
+                {
+                    continue;
+                }
+
+                var query = string.Join(' ', tokens.Skip(start).Take(wordCount));
+                var matchCount = normalizedCatalogueNames.Count(name =>
+                    name.Contains(query, StringComparison.Ordinal));
+                var weakBoundary = wordCount > 1 &&
+                    (IsWeakStandaloneToken(tokens[start]) ||
+                        IsWeakStandaloneToken(tokens[start + wordCount - 1]));
+                candidates.Add((query, matchCount, weakBoundary));
+            }
+        }
+
+        var unique = candidates
+            .Where(candidate => candidate.MatchCount == 1)
+            .OrderBy(candidate => candidate.WeakBoundary)
+            .ThenBy(candidate => candidate.Query.Length)
+            .ThenBy(candidate => candidate.Query, StringComparer.Ordinal)
+            .FirstOrDefault();
+        if (unique.MatchCount == 1)
+        {
+            return unique.Query;
+        }
+
+        return candidates
+            .Where(candidate => candidate.MatchCount > 0)
+            .OrderBy(candidate => candidate.MatchCount)
+            .ThenBy(candidate => candidate.WeakBoundary)
+            .ThenByDescending(candidate => candidate.Query.Count(character => character == ' '))
+            .ThenByDescending(candidate => candidate.Query.Length)
+            .ThenBy(candidate => candidate.Query, StringComparer.Ordinal)
+            .Select(candidate => candidate.Query)
+            .FirstOrDefault() ?? string.Join(' ', tokens);
+    }
+
+    internal static string CreateQuotedSearchQuery(CurrencyIdentity targetCurrency)
+    {
+        var normalizedName = string.Join(' ', Tokenize(targetCurrency.Name));
+        return normalizedName.Length == 0 ? "" : $"\"{normalizedName}\"";
+    }
+
+    private static bool IsWeakStandaloneToken(string token)
+    {
+        return token.Length < 3 || IsStopword(token);
+    }
+
+    private static bool IsStopword(string token)
+    {
+        return token is
+            "and" or "for" or "from" or "of" or "or" or "the" or "to" or "with";
+    }
+
+    private static IReadOnlyList<string> Tokenize(string currencyName)
     {
         var tokens = new List<string>();
         var current = new StringBuilder();
@@ -437,24 +564,35 @@ public sealed class CurrencySearchQueryController
             tokens.Add(current.ToString());
         }
 
-        return tokens
-            .OrderByDescending(token => token.Length)
-            .ThenBy(token => token, StringComparer.Ordinal)
-            .FirstOrDefault() ?? "";
+        return tokens;
     }
 
-    private static bool TryEncodeQuery(string query, out IReadOnlyList<Keys> keys)
+    private static bool TryEncodeQuery(
+        string query,
+        out IReadOnlyList<QueryKeyStroke> keys)
     {
-        var encoded = new List<Keys>(query.Length);
+        var encoded = new List<QueryKeyStroke>(query.Length);
         foreach (var character in query)
         {
             if (character is >= 'a' and <= 'z')
             {
-                encoded.Add((Keys)((int)Keys.A + character - 'a'));
+                encoded.Add(new QueryKeyStroke(
+                    (Keys)((int)Keys.A + character - 'a'),
+                    false));
             }
             else if (character is >= '0' and <= '9')
             {
-                encoded.Add((Keys)((int)Keys.D0 + character - '0'));
+                encoded.Add(new QueryKeyStroke(
+                    (Keys)((int)Keys.D0 + character - '0'),
+                    false));
+            }
+            else if (character == ' ')
+            {
+                encoded.Add(new QueryKeyStroke(Keys.Space, false));
+            }
+            else if (character == '"')
+            {
+                encoded.Add(new QueryKeyStroke(Keys.OemQuotes, true));
             }
             else
             {
@@ -467,10 +605,13 @@ public sealed class CurrencySearchQueryController
         return encoded.Count > 0;
     }
 
-    private void Fail(string reason)
+    private void Fail(
+        string reason,
+        CurrencySearchQueryFailureKind failureKind = CurrencySearchQueryFailureKind.Automation)
     {
         State = CurrencySearchQueryState.Faulted;
         VerifiedTarget = null;
+        FailureKind = failureKind;
         Status = reason;
     }
 }
