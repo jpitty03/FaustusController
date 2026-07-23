@@ -215,8 +215,16 @@ public sealed partial class FaustusController
             _routePlanStatus,
             new Vector2(100, 440),
             SharpDX.Color.Cyan);
+        Graphics.DrawText(
+            _inventorySyncStatus,
+            new Vector2(100, 460),
+            SharpDX.Color.Cyan);
+        Graphics.DrawText(
+            _placedOrdersStatus,
+            new Vector2(100, 480),
+            SharpDX.Color.Cyan);
 
-        RenderRouteAnalysis(460);
+        RenderRouteAnalysis(500);
 
         if (_previewTarget != null)
         {

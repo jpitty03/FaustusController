@@ -260,6 +260,21 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
             ExportRouteExecutionPlan();
         }
 
+        if (Settings.SyncInventoryFromPicker.PressedOnce())
+        {
+            SyncInventoryFromPicker();
+        }
+
+        if (Settings.ExportPlacedOrders.PressedOnce())
+        {
+            ExportPlacedOrders();
+        }
+
+        if (Settings.CalibrateGoldCost.PressedOnce())
+        {
+            CalibrateGoldCostFromOrders();
+        }
+
         if (Settings.RunSinglePairAutomation.PressedOnce())
         {
             StartSinglePairAutomation();

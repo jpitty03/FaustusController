@@ -19,7 +19,7 @@ dotnet build FaustusController.csproj
 
 | Folder | Contents |
 |---|---|
-| `Core/` | `FaustusController` plugin class (partial, split by concern: main/lifecycle, `.Picker`, `.Automation`, `.Discovery`, `.Routing`, `.Render`) and `FaustusControllerSettings` |
+| `Core/` | `FaustusController` plugin class (partial, split by concern: main/lifecycle, `.Picker`, `.Automation`, `.Discovery`, `.Routing`, `.Orders`, `.Render`) and `FaustusControllerSettings` |
 | `Domain/` | Core value types: `ExchangeRates.cs` (pair keys, `RationalExchangeRate`, `ExchangeRateBook`, snapshots), `CurrencyCatalogue` |
 | `Input/` | Human-like verified input: cursor tween, search focus/query, verified option move/click, picker button calibration, calibrated picker open, picker inspector |
 | `Capture/` | Reading the exchange panel (`CurrencyExchangeRateCollector`) and JSON persistence (`RateCaptureJsonExporter`, capture models, legacy formats) |
@@ -39,8 +39,8 @@ dotnet build FaustusController.csproj
 
 Work these in order; each step builds on the previous one.
 
-1. **Live inventory from picker** — read `Owned` on picker options to auto-fill `InventoryBalances` instead of manual JSON entries.
-2. **Real gold costs from placed orders** — read `PlacedCurrencyExchangeOrder.GoldCost` to calibrate `GoldCostPerHop` estimates.
+1. ~~**Live inventory from picker**~~ — DONE: `SyncInventoryFromPicker` (`Core/FaustusController.Orders.cs`) merges visible picker `Owned` counts into the route request's `InventoryBalances`.
+2. ~~**Real gold costs from placed orders**~~ — DONE: `CalibrateGoldCostFromOrders` sets `GoldCostPerHop` to the median gold cost of placed orders.
 3. **Order amount input** — type into `OfferedItemCountInput`/`WantedItemCountInput` (foreground-gated, verified, cancelable).
 4. **Order placement state machine** — select pair, set amount, place order, verify result, abort on any failure.
 5. **Single-hop execution** — execute one step from the route plan end-to-end with pre/post rate verification.
@@ -50,7 +50,7 @@ Work these in order; each step builds on the previous one.
 9. **Gold budget enforcement** — track cumulative gold across executed steps; halt at `GoldBudget`.
 10. **Automation history log** — append each executed step to a league-scoped JSON audit trail.
 
-**Required alongside steps 4–6**: competing trades (orders not fulfilled instantly) sit in a waiting period. Expose a method to view **completed/pending listings** (read `PlacedCurrencyExchangeOrders` from the panel) so execution can wait on, verify, or cancel outstanding orders.
+**Required alongside steps 4–6**: competing trades (orders not fulfilled instantly) sit in a waiting period. Viewing listings is DONE: `ExportPlacedOrders` (`Core/FaustusController.Orders.cs`) reads `CurrencyExchangePanel.Orders` and exports pending/completed/canceled orders to `FaustusController_placed-orders-<League>.json`. Still needed with steps 4–6: wait-on and cancel actions for outstanding orders.
 
 ## Maintaining this codebase
 

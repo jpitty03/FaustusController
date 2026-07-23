@@ -77,4 +77,16 @@ public sealed class FaustusControllerSettings : ISettings
     {
         IgnoreFocusedInput = true
     };
+    public HotkeyNodeV2 SyncInventoryFromPicker { get; set; } = new(Keys.NumPad7)
+    {
+        IgnoreFocusedInput = true
+    };
+    public HotkeyNodeV2 ExportPlacedOrders { get; set; } = new(Keys.NumPad8)
+    {
+        IgnoreFocusedInput = true
+    };
+    public HotkeyNodeV2 CalibrateGoldCost { get; set; } = new(Keys.NumPad9)
+    {
+        IgnoreFocusedInput = true
+    };
 }
