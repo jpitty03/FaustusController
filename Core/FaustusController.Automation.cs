@@ -104,7 +104,8 @@ public sealed partial class FaustusController
         }
 
         if (_pickerOpenController.IsRunning || _searchQueryController.IsRunning ||
-            _cursorTweenController.IsRunning || _selectionController.IsRunning)
+            _cursorTweenController.IsRunning || _selectionController.IsRunning ||
+            _amountInputController.IsRunning)
         {
             _liquidityDiscoveryController.Block(
                 $"{operation} blocked: another input operation is running.");
@@ -153,6 +154,7 @@ public sealed partial class FaustusController
         _searchQueryController.Cancel($"Query controller reset for {operation.ToLowerInvariant()}.");
         _cursorTweenController.Cancel($"Cursor tween reset for {operation.ToLowerInvariant()}.");
         _selectionController.Cancel($"Selection controller reset for {operation.ToLowerInvariant()}.");
+        _amountInputController.Cancel($"Amount input reset for {operation.ToLowerInvariant()}.");
         if (_liquidityDiscoveryController.Start(
             GameController,
             plan.Steps,
@@ -225,6 +227,7 @@ public sealed partial class FaustusController
         _searchQueryController.Cancel(reason);
         _cursorTweenController.Cancel(reason);
         _selectionController.Cancel(reason);
+        _amountInputController.Cancel(reason);
     }
 
     private bool StoreAndExportAutomatedSnapshot(

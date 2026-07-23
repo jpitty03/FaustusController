@@ -41,7 +41,7 @@ Work these in order; each step builds on the previous one.
 
 1. ~~**Live inventory from picker**~~ — DONE: `SyncInventoryFromPicker` (`Core/FaustusController.Orders.cs`) merges visible picker `Owned` counts into the route request's `InventoryBalances`.
 2. ~~**Real gold costs from placed orders**~~ — DONE: `CalibrateGoldCostFromOrders` sets `GoldCostPerHop` to the median gold cost of placed orders.
-3. **Order amount input** — type into `OfferedItemCountInput`/`WantedItemCountInput` (foreground-gated, verified, cancelable).
+3. ~~**Order amount input**~~ — DONE: `CurrencyAmountInputController` (`Input/CurrencyAmountInputController.cs`) tweens to, clicks, and types a verified amount into `OfferedItemCountInput`/`WantedItemCountInput`; NumPad4/NumPad5 type the selected route's first-hop `Spent`/`Received` behind the `AllowOrderAmountInput` toggle.
 4. **Order placement state machine** — select pair, set amount, place order, verify result, abort on any failure.
 5. **Single-hop execution** — execute one step from the route plan end-to-end with pre/post rate verification.
 6. **Multi-hop route execution** — chain all plan steps sequentially with per-hop verification and cancel-on-failure.
@@ -62,3 +62,6 @@ Work these in order; each step builds on the previous one.
 - **Persistence changes**: bump `SchemaVersion`, keep readers tolerant of old files (see `Capture/LegacyRateCaptureFormats.cs` for the migration pattern).
 - **Verify**: `dotnet build` must pass with 0 warnings before committing.
 - **This file**: keep it short. Update the Roadmap checklist as steps land (mark done / remove), record only durable architecture decisions here — not session-by-session implementation logs. Point to source files as the source of truth instead of duplicating their contents.
+
+## Github Policy
+Don't auto commit

@@ -13,6 +13,7 @@ public sealed class FaustusControllerSettings : ISettings
     public ToggleNode AllowCalibratedPickerOpen { get; set; } = new(false);
     public ToggleNode AllowLiquidityDiscoveryAutomation { get; set; } = new(false);
     public ToggleNode AllowActiveRefreshAutomation { get; set; } = new(false);
+    public ToggleNode AllowOrderAmountInput { get; set; } = new(false);
     public RangeNode<int> MaximumQuoteAgeMinutes { get; set; } = new(15, 1, 1440);
     public RangeNode<int> CursorTweenSpeed { get; set; } = new(1600, 400, 4000);
     public HotkeyNodeV2 RunRouteAnalysis { get; set; } = new(Keys.Home)
@@ -48,6 +49,14 @@ public sealed class FaustusControllerSettings : ISettings
         IgnoreFocusedInput = true
     };
     public HotkeyNodeV2 CalibrateGoldCost { get; set; } = new(Keys.NumPad9)
+    {
+        IgnoreFocusedInput = true
+    };
+    public HotkeyNodeV2 TypeOfferedAmount { get; set; } = new(Keys.NumPad4)
+    {
+        IgnoreFocusedInput = true
+    };
+    public HotkeyNodeV2 TypeWantedAmount { get; set; } = new(Keys.NumPad5)
     {
         IgnoreFocusedInput = true
     };

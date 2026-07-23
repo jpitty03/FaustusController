@@ -340,4 +340,59 @@ public sealed partial class FaustusController
             JsonConvert.SerializeObject(value, Formatting.Indented));
         File.Move(temporaryPath, path, overwrite: true);
     }
+
+    private void StartOrderAmountInput(bool wantedInput)
+    {
+        if (!Settings.AllowOrderAmountInput)
+        {
+            _amountInputController.Cancel(
+                "Amount input blocked: enable Allow Order Amount Input first.");
+            return;
+        }
+
+        if (IsAnyAutomationRunning)
+        {
+            _amountInputController.Cancel(
+                "Amount input blocked: automated scanning is running.");
+            return;
+        }
+
+        if (_pickerOpenController.IsRunning || _searchQueryController.IsRunning ||
+            _cursorTweenController.IsRunning || _selectionController.IsRunning)
+        {
+            _amountInputController.Cancel(
+                "Amount input blocked: another input operation is running.");
+            return;
+        }
+
+        var analysis = _lastRouteAnalysis;
+        if (analysis == null || analysis.Routes.Count == 0)
+        {
+            _amountInputController.Cancel(
+                "Amount input blocked: run route analysis (Home) first.");
+            return;
+        }
+
+        var routeIndex = Math.Clamp(_routeDisplayIndex, 0, analysis.Routes.Count - 1);
+        var route = analysis.Routes[routeIndex];
+        if (route.Hops.Count == 0)
+        {
+            _amountInputController.Cancel(
+                "Amount input blocked: the selected route has no hops.");
+            return;
+        }
+
+        var hop = route.Hops[0];
+        var amount = wantedInput ? hop.Received : hop.Spent;
+        var triggerKey = wantedInput
+            ? Settings.TypeWantedAmount.Value.Key
+            : Settings.TypeOfferedAmount.Value.Key;
+        _amountInputController.Start(
+            GameController,
+            wantedInput,
+            amount,
+            triggerKey,
+            Settings.CursorTweenSpeed.Value,
+            out _);
+    }
 }

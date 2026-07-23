@@ -14,6 +14,7 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
     private readonly CurrencySearchQueryController _searchQueryController = new();
     private readonly CursorTweenController _cursorTweenController = new();
     private readonly VerifiedOptionSelectionController _selectionController = new();
+    private readonly CurrencyAmountInputController _amountInputController = new();
     private readonly PickerButtonCalibrationController _pickerButtonCalibration = new();
     private readonly PickerButtonCalibrationStore _pickerButtonCalibrationStore = new();
     private readonly CalibratedPickerOpenController _pickerOpenController = new();
@@ -139,6 +140,7 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
         _boundedScanController.Cancel("Bounded scan cancelled after area change.");
         _liquidityDiscoveryController.Cancel("Liquidity discovery cancelled after area change.");
         _searchQueryController.Cancel("Search query cancelled after area change.");
+        _amountInputController.Cancel("Order amount input cancelled after area change.");
         _marketDiscoveryDirty = true;
         _nextMarketDiscoveryRetryUtc = DateTimeOffset.UtcNow;
         _conversionGraphDirty = true;
@@ -190,6 +192,16 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
             StartPickerButtonCalibration();
         }
 
+        if (Settings.TypeOfferedAmount.PressedOnce())
+        {
+            StartOrderAmountInput(wantedInput: false);
+        }
+
+        if (Settings.TypeWantedAmount.PressedOnce())
+        {
+            StartOrderAmountInput(wantedInput: true);
+        }
+
         if (_liquidityDiscoveryController.IsRunning &&
             !(_activeRefreshRun
                 ? AreActiveRefreshPermissionsEnabled()
@@ -231,6 +243,16 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
         }
 
         _selectionController.Tick(GameController);
+        if (_amountInputController.IsRunning && !Settings.AllowOrderAmountInput)
+        {
+            _amountInputController.Cancel(
+                "Amount input cancelled: Allow Order Amount Input was disabled.");
+        }
+        else
+        {
+            _amountInputController.Tick(GameController);
+        }
+
         if (_pickerOpenController.IsRunning && !Settings.AllowCalibratedPickerOpen)
         {
             _pickerOpenController.Cancel(
