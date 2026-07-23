@@ -28,6 +28,7 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
     private readonly ActiveMarketDiscoveryExporter _marketDiscoveryExporter = new();
     private readonly CurrencyConversionGraphExporter _conversionGraphExporter = new();
     private readonly CurrencyRouteAnalyzer _routeAnalyzer = new();
+    private readonly CurrencyRouteExecutionPlanExporter _routePlanExporter = new();
     private readonly Guid _collectorSessionId = Guid.NewGuid();
     private long _lastAttemptedBoundedScanRevision = -1;
     private long _lastPersistedBoundedScanRevision = -1;
@@ -51,6 +52,8 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
     private string _activeRefreshPlanPath = "";
     private string _routeRequestPath = "";
     private string _routeAnalysisPath = "";
+    private string _routePlanPath = "";
+    private string _routePlanStatus = "Press End to export the displayed route as an execution plan.";
     private bool _activeRefreshPlanDirty;
     private DateTimeOffset _nextActiveRefreshPlanRetryUtc;
     private string _discoveryProbePath = "";
@@ -66,6 +69,7 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
     private string _activeRefreshStatus = "Active refresh plan is waiting for discovery.";
     private string _routeAnalysisStatus = "Press Home to create/run exact route analysis.";
     private CurrencyRouteAnalysisFile? _lastRouteAnalysis;
+    private int _routeDisplayIndex;
     private string _scanStatus = "Press F7 to build and preview the next scan step.";
     private string _inputStatus = "Search focus input is disabled by default.";
 
@@ -82,6 +86,9 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         Settings.RunLiquidityDiscoveryAutomation.IgnoreFocusedInput = true;
         Settings.RunActiveRefreshAutomation.IgnoreFocusedInput = true;
         Settings.RunRouteAnalysis.IgnoreFocusedInput = true;
+        Settings.ExportRoutePlan.IgnoreFocusedInput = true;
+        Settings.CycleRouteUp.IgnoreFocusedInput = true;
+        Settings.CycleRouteDown.IgnoreFocusedInput = true;
         _exportPath = Path.Combine(ConfigDirectory, "FaustusController_rate-captures.json");
         _pickerButtonCalibrationPath = Path.Combine(
             ConfigDirectory,
@@ -241,6 +248,16 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
         if (Settings.RunRouteAnalysis.PressedOnce())
         {
             RunRouteAnalysis();
+        }
+
+        if (Settings.CycleRouteUp.PressedOnce() || Settings.CycleRouteDown.PressedOnce())
+        {
+            CycleRouteDisplay(Settings.CycleRouteUp.PressedOnce());
+        }
+
+        if (Settings.ExportRoutePlan.PressedOnce())
+        {
+            ExportRouteExecutionPlan();
         }
 
         if (Settings.RunSinglePairAutomation.PressedOnce())
@@ -2145,6 +2162,7 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             {
                 _lastRouteAnalysis = JsonConvert.DeserializeObject<CurrencyRouteAnalysisFile>(
                     File.ReadAllText(_routeAnalysisPath));
+                _routeDisplayIndex = 0;
             }
             catch
             {
@@ -2181,6 +2199,89 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             : "";
     }
 
+    private void CycleRouteDisplay(bool up)
+    {
+        if (_lastRouteAnalysis == null || _lastRouteAnalysis.Routes.Count == 0)
+        {
+            _routeAnalysisStatus = "Route cycling: press Home to run analysis first.";
+            return;
+        }
+
+        var count = _lastRouteAnalysis.Routes.Count;
+        if (count == 1)
+        {
+            _routeAnalysisStatus = "Route cycling: only one route available.";
+            return;
+        }
+
+        _routeDisplayIndex = up
+            ? (_routeDisplayIndex - 1 + count) % count
+            : (_routeDisplayIndex + 1) % count;
+        var route = _lastRouteAnalysis.Routes[_routeDisplayIndex];
+        _routeAnalysisStatus = $"Route {route.Rank}/{count}: " +
+            $"{route.TargetUnits} {route.TargetCurrency.Name} in {route.HopCount} hops " +
+            $"(gold {route.TotalGoldCost}, stranded {route.StrandedRemainderCurrencyCount}).";
+    }
+
+    private void ExportRouteExecutionPlan()
+    {
+        if (IsAnyAutomationRunning)
+        {
+            _routePlanStatus = "Route plan export blocked: automated scan is running.";
+            return;
+        }
+
+        if (_catalogue == null)
+        {
+            _routePlanStatus = "Route plan export blocked: the live catalogue is unavailable.";
+            return;
+        }
+
+        if (_lastRouteAnalysis == null || _lastRouteAnalysis.Routes.Count == 0)
+        {
+            _routePlanStatus = "Route plan export blocked: press Home to run analysis first.";
+            return;
+        }
+
+        var league = GetCurrentLeague();
+        if (string.IsNullOrWhiteSpace(league))
+        {
+            _routePlanStatus = "Route plan export blocked: the current league is unavailable.";
+            return;
+        }
+
+        try
+        {
+            var sanitizedLeague = SanitizeFileName(league);
+            _routePlanPath = Path.Combine(
+                ConfigDirectory,
+                $"FaustusController_route-execution-{sanitizedLeague}.json");
+            var routeIndex = Math.Clamp(
+                _routeDisplayIndex,
+                0,
+                _lastRouteAnalysis.Routes.Count - 1);
+            var result = _routePlanExporter.Export(
+                _catalogue,
+                league,
+                _lastRouteAnalysis,
+                routeIndex,
+                _routePlanPath,
+                DateTimeOffset.UtcNow,
+                TimeSpan.FromMinutes(Settings.MaximumQuoteAgeMinutes.Value));
+            _routePlanStatus = result.Ready
+                ? $"Route plan: Rank {_lastRouteAnalysis.Routes[routeIndex].Rank} exported; " +
+                    $"{result.StepCount} steps, {result.ExpectedTargetUnits} target units. " +
+                    "All edges fresh at export."
+                : $"Route plan: Rank {_lastRouteAnalysis.Routes[routeIndex].Rank} exported; " +
+                    $"{result.StepCount} steps, {result.ExpectedTargetUnits} target units. " +
+                    $"{result.StaleStepCount} STALE step(s) at export.";
+        }
+        catch (Exception exception)
+        {
+            _routePlanStatus = $"Route plan export failed: {exception.Message}";
+        }
+    }
+
     private string GetCurrentLeague()
     {
         try
@@ -2212,34 +2313,48 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
     private void RenderRouteAnalysis(int startY)
     {
         var analysis = _lastRouteAnalysis;
-        if (analysis == null || analysis.BestRoute == null)
+        if (analysis == null || analysis.Routes.Count == 0)
         {
             return;
         }
 
+        var routeIndex = Math.Clamp(_routeDisplayIndex, 0, analysis.Routes.Count - 1);
+        var route = analysis.Routes[routeIndex];
+
         var y = startY;
         var x = 100;
-        var best = analysis.BestRoute;
+        var now = DateTimeOffset.UtcNow;
+        var maxAge = TimeSpan.FromMinutes(analysis.GraphMaximumQuoteAgeMinutes);
 
         Graphics.DrawText(
-            $"=== ROUTE ANALYSIS DRY RUN (Rank {best.Rank}) ===",
+            $"=== ROUTE ANALYSIS DRY RUN (Rank {route.Rank}/{analysis.Routes.Count}) ===",
             new Vector2(x, y),
             SharpDX.Color.White);
         y += 20;
 
         Graphics.DrawText(
-            $"{analysis.Request.StartAmount} {best.Hops.FirstOrDefault()?.OfferedCurrency.Name} " +
-            $"-> {best.TargetUnits} {best.TargetCurrency.Name} " +
-            $"in {best.HopCount} hops | gold: {best.TotalGoldCost} | " +
-            $"stranded: {best.StrandedRemainderCurrencyCount} currency",
+            $"{analysis.Request.StartAmount} {route.Hops.FirstOrDefault()?.OfferedCurrency.Name} " +
+            $"-> {route.TargetUnits} {route.TargetCurrency.Name} " +
+            $"in {route.HopCount} hops | gold: {route.TotalGoldCost} | " +
+            $"stranded: {route.StrandedRemainderCurrencyCount} currency",
             new Vector2(x, y),
             SharpDX.Color.Cyan);
         y += 20;
 
-        foreach (var hop in best.Hops)
+        foreach (var hop in route.Hops)
         {
+            var remaining = hop.CapturedAtUtc + maxAge - now;
+            var freshnessLabel = remaining > TimeSpan.Zero
+                ? $"fresh: {remaining.Minutes}m{remaining.Seconds:D1}s"
+                : "STALE";
+            var freshnessColor = remaining > TimeSpan.FromMinutes(5)
+                ? SharpDX.Color.LimeGreen
+                : remaining > TimeSpan.Zero
+                    ? SharpDX.Color.Yellow
+                    : SharpDX.Color.Red;
+
             Graphics.DrawText(
-                $"  Hop {hop.Sequence}: {hop.OfferedCurrency.Name} -> {hop.WantedCurrency.Name}",
+                $"  Hop {hop.Sequence}: {hop.OfferedCurrency.Name} -> {hop.WantedCurrency.Name}  [{freshnessLabel}]",
                 new Vector2(x, y),
                 SharpDX.Color.White);
             y += 20;
@@ -2258,11 +2373,11 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             Graphics.DrawText(
                 $"    {hop.BookSide} | {hop.Coherence} | gold: {hop.GoldCost} | {liquidityLabel}",
                 new Vector2(x, y),
-                SharpDX.Color.White);
+                freshnessColor);
             y += 20;
         }
 
-        foreach (var remainder in best.Remainders.Where(r => r.Units > 0))
+        foreach (var remainder in route.Remainders.Where(r => r.Units > 0))
         {
             Graphics.DrawText(
                 $"  Remainder: {remainder.Units} {remainder.Currency.Name}",
@@ -2328,7 +2443,7 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             : "none";
         Graphics.DrawText(
             $"Constraints: {constraintLabel} | truncated: {analysis.SearchTruncated.ToString().ToLowerInvariant()} | " +
-            $"routes: {analysis.Routes.Count}",
+            $"routes: {analysis.Routes.Count} | PageUp/PageDown to cycle",
             new Vector2(x, y),
             SharpDX.Color.Orange);
     }
@@ -2398,8 +2513,12 @@ public sealed class FaustusController : BaseSettingsPlugin<FaustusControllerSett
             _routeAnalysisStatus,
             new Vector2(100, 420),
             SharpDX.Color.Cyan);
+        Graphics.DrawText(
+            _routePlanStatus,
+            new Vector2(100, 440),
+            SharpDX.Color.Cyan);
 
-        RenderRouteAnalysis(440);
+        RenderRouteAnalysis(460);
 
         if (_previewTarget != null)
         {

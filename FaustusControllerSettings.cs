@@ -23,6 +23,18 @@ public sealed class FaustusControllerSettings : ISettings
     {
         IgnoreFocusedInput = true
     };
+    public HotkeyNodeV2 ExportRoutePlan { get; set; } = new(Keys.End)
+    {
+        IgnoreFocusedInput = true
+    };
+    public HotkeyNodeV2 CycleRouteUp { get; set; } = new(Keys.PageUp)
+    {
+        IgnoreFocusedInput = true
+    };
+    public HotkeyNodeV2 CycleRouteDown { get; set; } = new(Keys.PageDown)
+    {
+        IgnoreFocusedInput = true
+    };
     public HotkeyNodeV2 RunBoundedScanAutomation { get; set; } = new(Keys.F3)
     {
         IgnoreFocusedInput = true
