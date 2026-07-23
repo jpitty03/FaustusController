@@ -28,7 +28,6 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
     private readonly ActiveMarketDiscoveryExporter _marketDiscoveryExporter = new();
     private readonly CurrencyConversionGraphExporter _conversionGraphExporter = new();
     private readonly CurrencyRouteAnalyzer _routeAnalyzer = new();
-    private readonly CurrencyRouteExecutionPlanExporter _routePlanExporter = new();
     private readonly Guid _collectorSessionId = Guid.NewGuid();
     private long _lastAttemptedBoundedScanRevision = -1;
     private long _lastPersistedBoundedScanRevision = -1;
@@ -42,9 +41,7 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
     private DateTimeOffset _nextDiscoveryCatalogueAttemptUtc;
     private CurrencyCatalogue? _catalogue;
     private CurrencyScanPlan? _scanPlan;
-    private CurrencyScanPlanStep? _previewStep;
-    private CurrencyPickerOptionTarget? _previewTarget;
-    private string _captureStatus = "Use the capture hotkey with an exchange pair selected.";
+    private string _captureStatus = "";
     private string _exportPath = "";
     private string _pickerButtonCalibrationPath = "";
     private string _marketDiscoveryPath = "";
@@ -52,8 +49,6 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
     private string _activeRefreshPlanPath = "";
     private string _routeRequestPath = "";
     private string _routeAnalysisPath = "";
-    private string _routePlanPath = "";
-    private string _routePlanStatus = "Press End to export the displayed route as an execution plan.";
     private bool _activeRefreshPlanDirty;
     private DateTimeOffset _nextActiveRefreshPlanRetryUtc;
     private string _discoveryProbePath = "";
@@ -70,23 +65,14 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
     private string _routeAnalysisStatus = "Press Home to create/run exact route analysis.";
     private CurrencyRouteAnalysisFile? _lastRouteAnalysis;
     private int _routeDisplayIndex;
-    private string _scanStatus = "Press F7 to build and preview the next scan step.";
-    private string _inputStatus = "Search focus input is disabled by default.";
+    private string _inputStatus = "";
 
     public override bool Initialise()
     {
-        Settings.FocusPickerSearch.IgnoreFocusedInput = true;
-        Settings.EnterPickerSearchQuery.IgnoreFocusedInput = true;
-        Settings.MoveToVerifiedOption.IgnoreFocusedInput = true;
-        Settings.SelectVerifiedOption.IgnoreFocusedInput = true;
         Settings.CalibratePickerButtons.IgnoreFocusedInput = true;
-        Settings.OpenNextPlannedPicker.IgnoreFocusedInput = true;
-        Settings.RunSinglePairAutomation.IgnoreFocusedInput = true;
-        Settings.RunBoundedScanAutomation.IgnoreFocusedInput = true;
         Settings.RunLiquidityDiscoveryAutomation.IgnoreFocusedInput = true;
         Settings.RunActiveRefreshAutomation.IgnoreFocusedInput = true;
         Settings.RunRouteAnalysis.IgnoreFocusedInput = true;
-        Settings.ExportRoutePlan.IgnoreFocusedInput = true;
         Settings.CycleRouteUp.IgnoreFocusedInput = true;
         Settings.CycleRouteDown.IgnoreFocusedInput = true;
         _exportPath = Path.Combine(ConfigDirectory, "FaustusController_rate-captures.json");
@@ -145,9 +131,6 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
 
     public override void AreaChange(AreaInstance area)
     {
-        _previewStep = null;
-        _previewTarget = null;
-        _inputStatus = "Search focus preview cleared after area change.";
         _cursorTweenController.Cancel("Cursor tween cancelled after area change.");
         _selectionController.Cancel("Option selection verification cancelled after area change.");
         _pickerButtonCalibration.Cancel("Picker-button calibration cancelled after area change.");
@@ -161,79 +144,11 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
         _conversionGraphDirty = true;
         _nextConversionGraphRetryUtc = DateTimeOffset.UtcNow;
         _captureStatus = "Area changed; captured rate snapshots were retained.";
-        _scanStatus = "Dry-run preview cleared after area change.";
     }
 
     public override Job Tick()
     {
         EnsureMarketDiscoveryCatalogue();
-
-        if (Settings.CaptureCurrentRate.PressedOnce())
-        {
-            if (IsAnyAutomationRunning)
-            {
-                _captureStatus = "Manual capture blocked: automated scan is running.";
-            }
-            else
-            {
-                if (_collector.TryCaptureCurrentPair(
-                    GameController,
-                    out var snapshot,
-                    out var failureReason))
-                {
-                    var contextualSnapshot = AttachCaptureContext(
-                        snapshot!,
-                        ExchangeCaptureSource.Manual);
-                    _rateBook.Store(contextualSnapshot);
-                    var immediateStock = contextualSnapshot.TopImmediateStock;
-                    var rawImmediate = immediateStock == null
-                        ? ""
-                        : $" (raw wanted {immediateStock.RawGet}:{immediateStock.RawGive})";
-                    var competingStock = contextualSnapshot.TopCompetingStock;
-                    var rawCompeting = competingStock == null
-                        ? ""
-                        : $" (raw opposite {competingStock.RawGet}:{competingStock.RawGive})";
-                    _captureStatus = $"Captured {contextualSnapshot.OfferedCurrency.Name} -> " +
-                        $"{contextualSnapshot.WantedCurrency.Name} in " +
-                        $"{contextualSnapshot.League}. Market: " +
-                        $"{FormatRatio(contextualSnapshot.MarketRate)}; immediate: " +
-                        $"{FormatRatio(contextualSnapshot.TopImmediateRate)}{rawImmediate}; " +
-                        $"competing: {FormatRatio(contextualSnapshot.TopCompetingRate)}{rawCompeting}.";
-
-                    try
-                    {
-                        var exportResult = _exporter.Export(
-                            _rateBook.LatestSnapshots,
-                            _exportPath,
-                            activeCollectorSessionId: _collectorSessionId);
-                        _exportStatus = FormatExportStatus(exportResult);
-                        if (!RefreshMarketDiscovery())
-                        {
-                            _captureStatus +=
-                                " Active-market regeneration failed and will retry.";
-                        }
-                    }
-                    catch (Exception exception)
-                    {
-                        _exportStatus = $"Rate export failed: {exception.Message}";
-                    }
-                }
-                else
-                {
-                    _captureStatus = failureReason;
-                }
-            }
-        }
-
-        if (Settings.PreviewNextScanStep.PressedOnce())
-        {
-            StartDryRunPreview();
-        }
-
-        if (Settings.RunBoundedScanAutomation.PressedOnce())
-        {
-            ToggleBoundedScanAutomation();
-        }
 
         if (Settings.RunLiquidityDiscoveryAutomation.PressedOnce())
         {
@@ -255,11 +170,6 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
             CycleRouteDisplay(Settings.CycleRouteUp.PressedOnce());
         }
 
-        if (Settings.ExportRoutePlan.PressedOnce())
-        {
-            ExportRouteExecutionPlan();
-        }
-
         if (Settings.SyncInventoryFromPicker.PressedOnce())
         {
             SyncInventoryFromPicker();
@@ -275,56 +185,9 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
             CalibrateGoldCostFromOrders();
         }
 
-        if (Settings.RunSinglePairAutomation.PressedOnce())
-        {
-            StartSinglePairAutomation();
-        }
-
-        if (_previewStep != null)
-        {
-            UpdateDryRunTarget();
-        }
-
-        if (Settings.FocusPickerSearch.PressedOnce())
-        {
-            FocusPickerSearch();
-        }
-
-        if (Settings.EnterPickerSearchQuery.PressedOnce())
-        {
-            StartSearchQuery();
-        }
-
-        if (Settings.MoveToVerifiedOption.PressedOnce())
-        {
-            MoveToVerifiedOption();
-        }
-
-        if (Settings.SelectVerifiedOption.PressedOnce())
-        {
-            SelectVerifiedOption();
-        }
-
         if (Settings.CalibratePickerButtons.PressedOnce())
         {
             StartPickerButtonCalibration();
-        }
-
-        if (Settings.OpenNextPlannedPicker.PressedOnce())
-        {
-            OpenNextPlannedPicker();
-        }
-
-        if (_singlePairScanController.IsRunning && !AreSinglePairPermissionsEnabled())
-        {
-            CancelSinglePairAutomation(
-                "Single-pair scan cancelled: one or more required permission toggles were disabled.");
-        }
-
-        if (_boundedScanController.IsRunning && !AreBoundedScanPermissionsEnabled())
-        {
-            CancelBoundedScanAutomation(
-                "Bounded scan cancelled: one or more required permission toggles were disabled.");
         }
 
         if (_liquidityDiscoveryController.IsRunning &&
@@ -457,13 +320,6 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
                 if (!_boundedScanController.ConfirmSnapshotPersisted(out var confirmationFailure))
                 {
                     CancelBoundedScanAutomation(confirmationFailure);
-                }
-                else if (_scanPlan != null)
-                {
-                    _previewStep = _scanPlan.GetNextInitialCollectionStep(boundedSnapshot.Pair);
-                    _scanStatus = _previewStep == null
-                        ? "The initial collection scan plan is empty."
-                        : FormatScanStep(_previewStep);
                 }
             }
             else

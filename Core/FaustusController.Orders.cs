@@ -49,18 +49,37 @@ public sealed partial class FaustusController
             var requestPath = Path.Combine(
                 ConfigDirectory,
                 $"FaustusController_route-request-{SanitizeFileName(league)}.json");
-            var request = _routeAnalyzer.LoadOrCreateRequest(_catalogue, league, requestPath);
+            var request = LoadRouteRequestForEdit(league, requestPath);
 
-            var balances = request.InventoryBalances.ToDictionary(
-                balance => balance.Metadata,
-                balance => balance.Units,
-                StringComparer.Ordinal);
+            // The analyzer rejects balances for the target currency, so never
+            // store one and silently drop invalid or duplicate manual entries.
+            var targetMetadata = request.TargetCurrency.Metadata;
+            var balances = new Dictionary<string, long>(StringComparer.Ordinal);
+            foreach (var balance in request.InventoryBalances)
+            {
+                if (string.IsNullOrWhiteSpace(balance.Metadata) ||
+                    balance.Units <= 0 ||
+                    balance.Metadata == targetMetadata)
+                {
+                    continue;
+                }
+
+                balances[balance.Metadata] = balance.Units;
+            }
+
             var seen = 0;
             var updated = 0;
             var removed = 0;
+            var targetSkipped = false;
             foreach (var option in inspection!.VisibleOptions)
             {
                 seen++;
+                if (option.Currency.Metadata == targetMetadata)
+                {
+                    targetSkipped = true;
+                    continue;
+                }
+
                 if (option.Owned > 0)
                 {
                     if (!balances.TryGetValue(option.Currency.Metadata, out var existing) ||
@@ -84,7 +103,8 @@ public sealed partial class FaustusController
             WriteOrdersJsonAtomically(requestPath, request);
             _inventorySyncStatus =
                 $"Inventory sync: {seen} visible options seen; {updated} updated, " +
-                $"{removed} removed; {request.InventoryBalances.Count} balances stored. " +
+                $"{removed} removed; {request.InventoryBalances.Count} balances stored" +
+                (targetSkipped ? $"; skipped target {request.TargetCurrency.Name}. " : ". ") +
                 "Press Home to re-run analysis.";
         }
         catch (Exception exception)
@@ -187,7 +207,7 @@ public sealed partial class FaustusController
             var requestPath = Path.Combine(
                 ConfigDirectory,
                 $"FaustusController_route-request-{SanitizeFileName(league)}.json");
-            var request = _routeAnalyzer.LoadOrCreateRequest(_catalogue, league, requestPath);
+            var request = LoadRouteRequestForEdit(league, requestPath);
             var previous = request.GoldCostPerHop;
             var median = ComputeMedian(goldCosts);
             request.GoldCostPerHop = median;
@@ -202,6 +222,21 @@ public sealed partial class FaustusController
         {
             _placedOrdersStatus = $"Gold calibration failed: {exception.Message}";
         }
+    }
+
+    private CurrencyRouteRequestFile LoadRouteRequestForEdit(string league, string requestPath)
+    {
+        if (!File.Exists(requestPath))
+        {
+            return _routeAnalyzer.LoadOrCreateRequest(_catalogue!, league, requestPath);
+        }
+
+        // Load without strict validation so hotkey edits can repair a request
+        // file the analyzer would reject (for example a manually added balance
+        // for the target currency). Home still validates before analysis runs.
+        return JsonConvert.DeserializeObject<CurrencyRouteRequestFile>(
+            File.ReadAllText(requestPath)) ??
+            throw new InvalidDataException("The route request file is empty.");
     }
 
     private bool TryCollectPlacedOrders(

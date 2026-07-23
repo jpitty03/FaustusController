@@ -124,65 +124,6 @@ public sealed partial class FaustusController
             $"(gold {route.TotalGoldCost}, stranded {route.StrandedRemainderCurrencyCount}).";
     }
 
-    private void ExportRouteExecutionPlan()
-    {
-        if (IsAnyAutomationRunning)
-        {
-            _routePlanStatus = "Route plan export blocked: automated scan is running.";
-            return;
-        }
-
-        if (_catalogue == null)
-        {
-            _routePlanStatus = "Route plan export blocked: the live catalogue is unavailable.";
-            return;
-        }
-
-        if (_lastRouteAnalysis == null || _lastRouteAnalysis.Routes.Count == 0)
-        {
-            _routePlanStatus = "Route plan export blocked: press Home to run analysis first.";
-            return;
-        }
-
-        var league = GetCurrentLeague();
-        if (string.IsNullOrWhiteSpace(league))
-        {
-            _routePlanStatus = "Route plan export blocked: the current league is unavailable.";
-            return;
-        }
-
-        try
-        {
-            var sanitizedLeague = SanitizeFileName(league);
-            _routePlanPath = Path.Combine(
-                ConfigDirectory,
-                $"FaustusController_route-execution-{sanitizedLeague}.json");
-            var routeIndex = Math.Clamp(
-                _routeDisplayIndex,
-                0,
-                _lastRouteAnalysis.Routes.Count - 1);
-            var result = _routePlanExporter.Export(
-                _catalogue,
-                league,
-                _lastRouteAnalysis,
-                routeIndex,
-                _routePlanPath,
-                DateTimeOffset.UtcNow,
-                TimeSpan.FromMinutes(Settings.MaximumQuoteAgeMinutes.Value));
-            _routePlanStatus = result.Ready
-                ? $"Route plan: Rank {_lastRouteAnalysis.Routes[routeIndex].Rank} exported; " +
-                    $"{result.StepCount} steps, {result.ExpectedTargetUnits} target units. " +
-                    "All edges fresh at export."
-                : $"Route plan: Rank {_lastRouteAnalysis.Routes[routeIndex].Rank} exported; " +
-                    $"{result.StepCount} steps, {result.ExpectedTargetUnits} target units. " +
-                    $"{result.StaleStepCount} STALE step(s) at export.";
-        }
-        catch (Exception exception)
-        {
-            _routePlanStatus = $"Route plan export failed: {exception.Message}";
-        }
-    }
-
     private string GetCurrentLeague()
     {
         try

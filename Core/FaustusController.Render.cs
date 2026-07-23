@@ -153,86 +153,49 @@ public sealed partial class FaustusController
             currentLeague,
             DateTimeOffset.UtcNow,
             TimeSpan.FromMinutes(Settings.MaximumQuoteAgeMinutes.Value));
-        Graphics.DrawText(_captureStatus, new Vector2(100, 100), SharpDX.Color.White);
         Graphics.DrawText(
-            $"Latest captures: {_rateBook.Count}; " +
-            $"{freshQuoteCount} fresh latest market quotes in " +
+            $"Rates: {_rateBook.Count} captured; " +
+            $"{freshQuoteCount} fresh in " +
             $"{(string.IsNullOrWhiteSpace(currentLeague) ? "unknown league" : currentLeague)}",
-            new Vector2(100, 120),
+            new Vector2(100, 100),
             SharpDX.Color.White);
+        Graphics.DrawText(_captureStatus, new Vector2(100, 120), SharpDX.Color.White);
         Graphics.DrawText(_exportStatus, new Vector2(100, 140), SharpDX.Color.White);
-        Graphics.DrawText(_scanStatus, new Vector2(100, 160), SharpDX.Color.Yellow);
-        Graphics.DrawText(_inputStatus, new Vector2(100, 180), SharpDX.Color.Cyan);
         Graphics.DrawText(
-            _searchQueryController.Status,
-            new Vector2(100, 200),
+            _marketDiscoveryStatus,
+            new Vector2(100, 160),
+            SharpDX.Color.Yellow);
+        Graphics.DrawText(
+            _conversionGraphStatus,
+            new Vector2(100, 180),
             SharpDX.Color.Cyan);
         Graphics.DrawText(
-            _cursorTweenController.Status,
-            new Vector2(100, 220),
-            SharpDX.Color.Orange);
+            _liquidityDiscoveryController.Status,
+            new Vector2(100, 200),
+            SharpDX.Color.LimeGreen);
         Graphics.DrawText(
-            _selectionController.Status,
-            new Vector2(100, 240),
-            SharpDX.Color.Orange);
+            _activeRefreshStatus,
+            new Vector2(100, 220),
+            SharpDX.Color.Cyan);
+        Graphics.DrawText(_inputStatus, new Vector2(100, 240), SharpDX.Color.Cyan);
         Graphics.DrawText(
             _pickerButtonCalibration.Status,
             new Vector2(100, 260),
             SharpDX.Color.Magenta);
         Graphics.DrawText(
-            _pickerOpenController.Status,
-            new Vector2(100, 280),
-            SharpDX.Color.Magenta);
-        Graphics.DrawText(
-            _singlePairScanController.Status,
-            new Vector2(100, 300),
-            SharpDX.Color.LimeGreen);
-        Graphics.DrawText(
-            _boundedScanController.Status,
-            new Vector2(100, 320),
-            SharpDX.Color.LimeGreen);
-        Graphics.DrawText(
-            _marketDiscoveryStatus,
-            new Vector2(100, 340),
-            SharpDX.Color.Yellow);
-        Graphics.DrawText(
-            _liquidityDiscoveryController.Status,
-            new Vector2(100, 360),
-            SharpDX.Color.LimeGreen);
-        Graphics.DrawText(
-            _conversionGraphStatus,
-            new Vector2(100, 380),
-            SharpDX.Color.Cyan);
-        Graphics.DrawText(
-            _activeRefreshStatus,
-            new Vector2(100, 400),
-            SharpDX.Color.Cyan);
-        Graphics.DrawText(
             _routeAnalysisStatus,
-            new Vector2(100, 420),
-            SharpDX.Color.Cyan);
-        Graphics.DrawText(
-            _routePlanStatus,
-            new Vector2(100, 440),
+            new Vector2(100, 280),
             SharpDX.Color.Cyan);
         Graphics.DrawText(
             _inventorySyncStatus,
-            new Vector2(100, 460),
+            new Vector2(100, 300),
             SharpDX.Color.Cyan);
         Graphics.DrawText(
             _placedOrdersStatus,
-            new Vector2(100, 480),
+            new Vector2(100, 320),
             SharpDX.Color.Cyan);
 
-        RenderRouteAnalysis(500);
-
-        if (_previewTarget != null)
-        {
-            Graphics.DrawText(
-                $"DRY RUN TARGET: {_previewTarget.Currency.Name}",
-                _previewTarget.Center + new Vector2(6, -10),
-                SharpDX.Color.Yellow);
-        }
+        RenderRouteAnalysis(350);
 
         var panel = GameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
         if (panel.IsVisible)
