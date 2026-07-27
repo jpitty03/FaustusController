@@ -15,6 +15,7 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
     private readonly CursorTweenController _cursorTweenController = new();
     private readonly VerifiedOptionSelectionController _selectionController = new();
     private readonly CurrencyAmountInputController _amountInputController = new();
+    private readonly OrderStagingController _orderStagingController = new();
     private readonly PickerButtonCalibrationController _pickerButtonCalibration = new();
     private readonly PickerButtonCalibrationStore _pickerButtonCalibrationStore = new();
     private readonly CalibratedPickerOpenController _pickerOpenController = new();
@@ -141,6 +142,7 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
         _liquidityDiscoveryController.Cancel("Liquidity discovery cancelled after area change.");
         _searchQueryController.Cancel("Search query cancelled after area change.");
         _amountInputController.Cancel("Order amount input cancelled after area change.");
+        _orderStagingController.Cancel("Order staging cancelled after area change.");
         _marketDiscoveryDirty = true;
         _nextMarketDiscoveryRetryUtc = DateTimeOffset.UtcNow;
         _conversionGraphDirty = true;
@@ -192,14 +194,30 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
             StartPickerButtonCalibration();
         }
 
-        if (Settings.TypeOfferedAmount.PressedOnce())
+        if (Settings.TypeOfferedAmountKey.PressedOnce())
         {
             StartOrderAmountInput(wantedInput: false);
         }
 
-        if (Settings.TypeWantedAmount.PressedOnce())
+        if (Settings.TypeWantedAmountKey.PressedOnce())
         {
             StartOrderAmountInput(wantedInput: true);
+        }
+
+        if (Settings.StageOrderDryRunKey.PressedOnce())
+        {
+            StartOrderStagingDryRun();
+        }
+
+        if (Settings.DumpSdkReadsKey.PressedOnce())
+        {
+            DumpSdkReads();
+        }
+
+        if (_orderStagingController.IsRunning && !AreOrderStagingPermissionsEnabled())
+        {
+            _orderStagingController.Cancel(
+                "Order staging cancelled: one or more required permission toggles were disabled.");
         }
 
         if (_liquidityDiscoveryController.IsRunning &&
@@ -364,6 +382,28 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
                 _selectionController,
                 _collector,
                 Settings.CursorTweenSpeed.Value);
+
+            _orderStagingController.Tick(
+                GameController,
+                _catalogue,
+                _pickerButtonCalibration,
+                _pickerOpenController,
+                _pickerInspector,
+                _searchQueryController,
+                _cursorTweenController,
+                _selectionController,
+                _collector,
+                _amountInputController,
+                Settings.CursorTweenSpeed.Value);
+
+            var stagedSnapshot = _orderStagingController.TakeStagedSnapshot();
+            if (stagedSnapshot != null)
+            {
+                _ = StoreAndExportAutomatedSnapshot(
+                    stagedSnapshot,
+                    ExchangeCaptureSource.SinglePairAutomation,
+                    "Order staging");
+            }
         }
 
         var pendingProbe = _liquidityDiscoveryController.PendingProbe;

@@ -183,10 +183,21 @@ public sealed partial class FaustusController
             Settings.AllowVerifiedOptionClick;
     }
 
+    private bool AreOrderStagingPermissionsEnabled()
+    {
+        return Settings.AllowOrderStaging &&
+            Settings.AllowCalibratedPickerOpen &&
+            Settings.AllowSearchQueryInput &&
+            Settings.AllowVerifiedTargetMouseMove &&
+            Settings.AllowVerifiedOptionClick &&
+            Settings.AllowOrderAmountInput;
+    }
+
     private bool IsAnyAutomationRunning =>
         _singlePairScanController.IsRunning ||
         _boundedScanController.IsRunning ||
-        _liquidityDiscoveryController.IsRunning;
+        _liquidityDiscoveryController.IsRunning ||
+        _orderStagingController.IsRunning;
 
     private void CancelSinglePairAutomation(string reason)
     {

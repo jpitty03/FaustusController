@@ -582,7 +582,7 @@ public sealed class CurrencyAmountInputController
         return true;
     }
 
-    private static string ReadDigits(Element input)
+    public static string ReadDigits(Element input)
     {
         var text = FindText(input, TextSearchDepth) ?? "";
         return new string(text.Where(char.IsAsciiDigit).ToArray());

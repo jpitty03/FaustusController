@@ -27,24 +27,29 @@ public sealed class SinglePairScanController
 {
     private static readonly TimeSpan OperationTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan RateTimeout = TimeSpan.FromSeconds(5);
-    private static readonly TimeSpan RateSettleDelay = TimeSpan.FromMilliseconds(500);
-    private static readonly TimeSpan RatePollDelay = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan RateSettleDelay = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan RatePollDelay = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan MaximumNoMarketSampleGap = TimeSpan.FromMilliseconds(300);
+    // A no-market verdict may not be issued before this much time has passed in
+    // WaitingForStableRate, so faster polling cannot misread a slow server
+    // response as a missing market. Matches the old 500ms-settle timeline.
+    private static readonly TimeSpan MinimumNoMarketDecisionDelay = TimeSpan.FromMilliseconds(800);
 
     private CurrencyScanPlanStep? _step;
     private bool _activeWantedSide;
     private DateTimeOffset _operationDeadlineUtc;
     private DateTimeOffset _rateDeadlineUtc;
     private DateTimeOffset _nextRatePollAtUtc;
+    private DateTimeOffset _rateWaitStartedUtc;
     private bool _allowOpenPickerReuse;
     private bool _allowQuotedQueryFallback;
     private int _stableRateSamples;
     private int _lastRateGet;
     private int _lastRateGive;
     private ExchangePairSnapshot? _capturedSnapshot;
-    private bool _sawPositiveMarketRate;
+    private DateTimeOffset _lastPositiveRateAtUtc;
     private int _readableNoMarketSamples;
-    private bool _rateReadFailed;
+    private DateTimeOffset _lastRateReadFailureAtUtc;
     private DateTimeOffset _lastReadableNoMarketAtUtc;
     private bool _quotedQueryRetryAttempted;
 
@@ -82,9 +87,9 @@ public sealed class SinglePairScanController
 
         _step = step;
         _capturedSnapshot = null;
-        _sawPositiveMarketRate = false;
+        _lastPositiveRateAtUtc = default;
         _readableNoMarketSamples = 0;
-        _rateReadFailed = false;
+        _lastRateReadFailureAtUtc = default;
         _lastReadableNoMarketAtUtc = default;
         _quotedQueryRetryAttempted = false;
         _allowOpenPickerReuse = allowOpenPickerReuse;
@@ -410,6 +415,7 @@ public sealed class SinglePairScanController
             _stableRateSamples = 0;
             _lastRateGet = 0;
             _lastRateGive = 0;
+            _rateWaitStartedUtc = DateTimeOffset.UtcNow;
             _rateDeadlineUtc = DateTimeOffset.UtcNow + RateTimeout;
             _nextRatePollAtUtc = DateTimeOffset.UtcNow + RateSettleDelay;
             State = SinglePairScanState.WaitingForStableRate;
@@ -456,7 +462,7 @@ public sealed class SinglePairScanController
             out var snapshot,
             out var captureFailure))
         {
-            _rateReadFailed = true;
+            _lastRateReadFailureAtUtc = now;
             Status = $"Waiting for stable rate: {captureFailure}";
             return;
         }
@@ -477,7 +483,10 @@ public sealed class SinglePairScanController
                     ? _readableNoMarketSamples + 1
                     : 1;
             _lastReadableNoMarketAtUtc = now;
-            if (_readableNoMarketSamples >= 3 && !_sawPositiveMarketRate && !_rateReadFailed)
+            if (_readableNoMarketSamples >= 3 &&
+                now - _lastPositiveRateAtUtc >= MinimumNoMarketDecisionDelay &&
+                now - _lastRateReadFailureAtUtc >= MinimumNoMarketDecisionDelay &&
+                now - _rateWaitStartedUtc >= MinimumNoMarketDecisionDelay)
             {
                 Cancel(
                     "No immediate or competing market rate was observed in three consecutive readable samples.",
@@ -490,7 +499,7 @@ public sealed class SinglePairScanController
             return;
         }
 
-        _sawPositiveMarketRate = true;
+        _lastPositiveRateAtUtc = now;
 
         if (observedRate.RawGet == _lastRateGet &&
             observedRate.RawGive == _lastRateGive)

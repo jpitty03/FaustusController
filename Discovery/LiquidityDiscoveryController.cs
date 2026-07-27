@@ -24,7 +24,7 @@ public sealed record PendingDiscoveryProbe(
 
 public sealed class LiquidityDiscoveryController
 {
-    private static readonly TimeSpan BetweenPairDelay = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan BetweenPairDelay = TimeSpan.FromMilliseconds(200);
 
     private readonly SinglePairScanController _pairController = new();
     private IReadOnlyList<CurrencyScanPlanStep> _steps = [];
@@ -269,7 +269,7 @@ public sealed class LiquidityDiscoveryController
         _nextPairAtUtc = DateTimeOffset.UtcNow + BetweenPairDelay;
         State = LiquidityDiscoveryState.BetweenPairs;
         Status = $"Liquidity discovery persisted {CompletedCount}/{_steps.Count}; " +
-            "waiting 500 ms before the next probe.";
+            $"waiting {BetweenPairDelay.TotalMilliseconds:F0} ms before the next probe.";
         failureReason = string.Empty;
         return true;
     }

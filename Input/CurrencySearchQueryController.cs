@@ -34,6 +34,8 @@ public sealed class CurrencySearchQueryController
     private static readonly TimeSpan CharacterDelay = TimeSpan.FromMilliseconds(30);
     private static readonly TimeSpan FilterPollDelay = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan FilterTimeout = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan FilterStabilityWindow = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan MinimumNoMatchDecisionDelay = TimeSpan.FromMilliseconds(700);
     private static readonly TimeSpan OperationTimeout = TimeSpan.FromSeconds(6);
 
     private CurrencyIdentity? _targetCurrency;
@@ -44,6 +46,9 @@ public sealed class CurrencySearchQueryController
     private DateTimeOffset _nextActionAtUtc;
     private DateTimeOffset _filterDeadlineUtc;
     private DateTimeOffset _operationDeadlineUtc;
+    private DateTimeOffset _filterWaitStartedUtc;
+    private DateTimeOffset _filterStableSinceUtc;
+    private string? _lastFilterSignature;
 
     public CurrencySearchQueryState State { get; private set; } = CurrencySearchQueryState.Idle;
     public string Query { get; private set; } = "";
@@ -275,6 +280,9 @@ public sealed class CurrencySearchQueryController
 
                 State = CurrencySearchQueryState.WaitForFilteredOption;
                 _filterDeadlineUtc = now + FilterTimeout;
+                _filterWaitStartedUtc = now;
+                _filterStableSinceUtc = now;
+                _lastFilterSignature = null;
                 Status = $"Query '{Query}' entered; waiting for exact metadata match.";
                 _nextActionAtUtc = now + FilterPollDelay;
                 return;
@@ -304,6 +312,24 @@ public sealed class CurrencySearchQueryController
                 {
                     Fail(
                         $"Query '{Query}' did not produce a visible exact metadata match.",
+                        CurrencySearchQueryFailureKind.NoExactMetadataMatch);
+                    return;
+                }
+
+                var filterSignature = string.Join(
+                    "\n",
+                    inspection.VisibleOptions.Select(option => option.Currency.Metadata));
+                if (!string.Equals(filterSignature, _lastFilterSignature, StringComparison.Ordinal))
+                {
+                    _lastFilterSignature = filterSignature;
+                    _filterStableSinceUtc = now;
+                }
+                else if (now - _filterStableSinceUtc >= FilterStabilityWindow &&
+                    now - _filterWaitStartedUtc >= MinimumNoMatchDecisionDelay)
+                {
+                    Fail(
+                        $"Query '{Query}' produced a stable filtered list with no exact " +
+                            "metadata match; concluding early.",
                         CurrencySearchQueryFailureKind.NoExactMetadataMatch);
                     return;
                 }

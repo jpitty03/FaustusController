@@ -38,7 +38,8 @@ public sealed partial class FaustusController
             GameController,
             _catalogue,
             out var inspection,
-            out var failureReason))
+            out var failureReason,
+            includeOffScreenOptions: true))
         {
             _inventorySyncStatus = $"Inventory sync blocked: {failureReason}";
             return;
@@ -385,14 +386,90 @@ public sealed partial class FaustusController
         var hop = route.Hops[0];
         var amount = wantedInput ? hop.Received : hop.Spent;
         var triggerKey = wantedInput
-            ? Settings.TypeWantedAmount.Value.Key
-            : Settings.TypeOfferedAmount.Value.Key;
+            ? Settings.TypeWantedAmountKey.Value.Key
+            : Settings.TypeOfferedAmountKey.Value.Key;
         _amountInputController.Start(
             GameController,
             wantedInput,
             amount,
             triggerKey,
             Settings.CursorTweenSpeed.Value,
+            out _);
+    }
+
+    private void StartOrderStagingDryRun()
+    {
+        if (!AreOrderStagingPermissionsEnabled())
+        {
+            _orderStagingController.Cancel(
+                "Order staging blocked: enable Allow Order Staging plus the picker-open, " +
+                    "search-query, mouse-move, option-click, and amount-input toggles first.");
+            return;
+        }
+
+        if (IsAnyAutomationRunning)
+        {
+            _orderStagingController.Cancel(
+                "Order staging blocked: automated scanning is running.");
+            return;
+        }
+
+        if (_pickerOpenController.IsRunning || _searchQueryController.IsRunning ||
+            _cursorTweenController.IsRunning || _selectionController.IsRunning ||
+            _amountInputController.IsRunning)
+        {
+            _orderStagingController.Cancel(
+                "Order staging blocked: another input operation is running.");
+            return;
+        }
+
+        if (_catalogue == null)
+        {
+            _orderStagingController.Cancel(
+                "Order staging blocked: the currency catalogue is not ready.");
+            return;
+        }
+
+        var analysis = _lastRouteAnalysis;
+        if (analysis == null || analysis.Routes.Count == 0)
+        {
+            _orderStagingController.Cancel(
+                "Order staging blocked: run route analysis (Home) first.");
+            return;
+        }
+
+        var routeIndex = Math.Clamp(_routeDisplayIndex, 0, analysis.Routes.Count - 1);
+        var route = analysis.Routes[routeIndex];
+        if (route.Hops.Count == 0)
+        {
+            _orderStagingController.Cancel(
+                "Order staging blocked: the selected route has no hops.");
+            return;
+        }
+
+        var hop = route.Hops[0];
+        if (!_catalogue.TryGetByMetadata(hop.OfferedCurrency.Metadata, out var offered) ||
+            offered == null)
+        {
+            _orderStagingController.Cancel(
+                $"Order staging blocked: '{hop.OfferedCurrency.Name}' is not in the catalogue.");
+            return;
+        }
+
+        if (!_catalogue.TryGetByMetadata(hop.WantedCurrency.Metadata, out var wanted) ||
+            wanted == null)
+        {
+            _orderStagingController.Cancel(
+                $"Order staging blocked: '{hop.WantedCurrency.Name}' is not in the catalogue.");
+            return;
+        }
+
+        var step = new CurrencyScanPlanStep(0, offered, wanted);
+        _ = _orderStagingController.Start(
+            GameController,
+            step,
+            hop.Spent,
+            hop.Received,
             out _);
     }
 }

@@ -52,11 +52,22 @@ public sealed class FaustusControllerSettings : ISettings
     {
         IgnoreFocusedInput = true
     };
-    public HotkeyNodeV2 TypeOfferedAmount { get; set; } = new(Keys.NumPad4)
+    // F-keys on purpose: NumPad digits are character keys, so pressing them
+    // while a count input is still focused types a stray digit into the field.
+    public HotkeyNodeV2 TypeOfferedAmountKey { get; set; } = new(Keys.F3)
     {
         IgnoreFocusedInput = true
     };
-    public HotkeyNodeV2 TypeWantedAmount { get; set; } = new(Keys.NumPad5)
+    public HotkeyNodeV2 TypeWantedAmountKey { get; set; } = new(Keys.F4)
+    {
+        IgnoreFocusedInput = true
+    };
+    public ToggleNode AllowOrderStaging { get; set; } = new(false);
+    public HotkeyNodeV2 StageOrderDryRunKey { get; set; } = new(Keys.F6)
+    {
+        IgnoreFocusedInput = true
+    };
+    public HotkeyNodeV2 DumpSdkReadsKey { get; set; } = new(Keys.F7)
     {
         IgnoreFocusedInput = true
     };
