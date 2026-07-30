@@ -71,4 +71,13 @@ public sealed class FaustusControllerSettings : ISettings
     {
         IgnoreFocusedInput = true
     };
+    public ToggleNode AllowOrderPlacement { get; set; } = new(false);
+    public HotkeyNodeV2 PlaceOrderKey { get; set; } = new(Keys.F8)
+    {
+        IgnoreFocusedInput = true
+    };
+    public HotkeyNodeV2 CalibratePlaceOrderButtonKey { get; set; } = new(Keys.F9)
+    {
+        IgnoreFocusedInput = true
+    };
 }

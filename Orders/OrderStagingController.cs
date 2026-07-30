@@ -45,6 +45,11 @@ public sealed class OrderStagingController
         OrderStagingState.TypingWantedAmount or
         OrderStagingState.LockingInAmounts;
 
+    // Staged order details, read by OrderPlacementController once State is Staged.
+    public CurrencyScanPlanStep? CurrentStep => _step;
+    public long OfferedAmount => _offeredAmount;
+    public long WantedAmount => _wantedAmount;
+
     public bool Start(
         GameController gameController,
         CurrencyScanPlanStep step,

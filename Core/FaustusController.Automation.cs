@@ -193,11 +193,17 @@ public sealed partial class FaustusController
             Settings.AllowOrderAmountInput;
     }
 
+    private bool AreOrderPlacementPermissionsEnabled()
+    {
+        return Settings.AllowOrderPlacement && AreOrderStagingPermissionsEnabled();
+    }
+
     private bool IsAnyAutomationRunning =>
         _singlePairScanController.IsRunning ||
         _boundedScanController.IsRunning ||
         _liquidityDiscoveryController.IsRunning ||
-        _orderStagingController.IsRunning;
+        _orderStagingController.IsRunning ||
+        _orderPlacementController.IsRunning;
 
     private void CancelSinglePairAutomation(string reason)
     {
@@ -230,6 +236,19 @@ public sealed partial class FaustusController
 
         _liquidityDiscoveryController.Cancel(reason);
         CancelSharedInputControllers(reason);
+    }
+
+    private void CancelOrderPlacement(string reason)
+    {
+        if (_orderStagingController.IsRunning)
+        {
+            _orderStagingController.Cancel(reason);
+        }
+
+        if (_orderPlacementController.IsRunning)
+        {
+            _orderPlacementController.Cancel(reason);
+        }
     }
 
     private void CancelSharedInputControllers(string reason)

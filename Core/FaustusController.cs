@@ -16,6 +16,7 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
     private readonly VerifiedOptionSelectionController _selectionController = new();
     private readonly CurrencyAmountInputController _amountInputController = new();
     private readonly OrderStagingController _orderStagingController = new();
+    private readonly OrderPlacementController _orderPlacementController = new();
     private readonly PickerButtonCalibrationController _pickerButtonCalibration = new();
     private readonly PickerButtonCalibrationStore _pickerButtonCalibrationStore = new();
     private readonly CalibratedPickerOpenController _pickerOpenController = new();
@@ -143,6 +144,7 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
         _searchQueryController.Cancel("Search query cancelled after area change.");
         _amountInputController.Cancel("Order amount input cancelled after area change.");
         _orderStagingController.Cancel("Order staging cancelled after area change.");
+        _orderPlacementController.Cancel("Order placement cancelled after area change.");
         _marketDiscoveryDirty = true;
         _nextMarketDiscoveryRetryUtc = DateTimeOffset.UtcNow;
         _conversionGraphDirty = true;
@@ -214,10 +216,26 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
             DumpSdkReads();
         }
 
+        if (Settings.CalibratePlaceOrderButtonKey.PressedOnce())
+        {
+            _pickerButtonCalibration.CapturePlaceOrderButton(GameController);
+        }
+
+        if (Settings.PlaceOrderKey.PressedOnce())
+        {
+            StartOrderPlacement();
+        }
+
         if (_orderStagingController.IsRunning && !AreOrderStagingPermissionsEnabled())
         {
             _orderStagingController.Cancel(
                 "Order staging cancelled: one or more required permission toggles were disabled.");
+        }
+
+        if (_orderPlacementController.IsRunning && !AreOrderPlacementPermissionsEnabled())
+        {
+            CancelOrderPlacement(
+                "Order placement cancelled: one or more required permission toggles were disabled.");
         }
 
         if (_liquidityDiscoveryController.IsRunning &&
@@ -404,6 +422,16 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
                     ExchangeCaptureSource.SinglePairAutomation,
                     "Order staging");
             }
+        }
+
+        _orderPlacementController.Tick(
+            GameController,
+            _orderStagingController,
+            _pickerButtonCalibration,
+            Settings.CursorTweenSpeed.Value);
+        if (_orderPlacementController.TakeCompletedNotification())
+        {
+            ExportPlacedOrders();
         }
 
         var pendingProbe = _liquidityDiscoveryController.PendingProbe;

@@ -472,4 +472,50 @@ public sealed partial class FaustusController
             hop.Received,
             out _);
     }
+
+    private void StartOrderPlacement()
+    {
+        // Pressing the hotkey while a placement run is in flight aborts it.
+        if (_orderPlacementController.IsRunning)
+        {
+            CancelOrderPlacement("Order placement cancelled by hotkey.");
+            return;
+        }
+
+        if (!AreOrderPlacementPermissionsEnabled())
+        {
+            _orderPlacementController.Cancel(
+                "Order placement blocked: enable Allow Order Placement plus every " +
+                    "order-staging toggle first.");
+            return;
+        }
+
+        var panel = GameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
+        if (!panel.IsVisible ||
+            !_pickerButtonCalibration.TryResolvePlaceOrder(panel.GetClientRectCache, out _))
+        {
+            _orderPlacementController.Cancel(
+                "Order placement blocked: open the exchange panel, hover Place Order, " +
+                    "and press F9 to calibrate it first.");
+            return;
+        }
+
+        // Stage the first hop exactly like the F6 dry run; placement takes over
+        // only after staging reaches its verified Staged state.
+        StartOrderStagingDryRun();
+        if (!_orderStagingController.IsRunning)
+        {
+            _orderPlacementController.Cancel(
+                $"Order placement blocked: staging could not start. {_orderStagingController.Status}");
+            return;
+        }
+
+        if (!_orderPlacementController.Start(
+            GameController,
+            _pickerButtonCalibration,
+            out var failureReason))
+        {
+            _orderStagingController.Cancel(failureReason);
+        }
+    }
 }

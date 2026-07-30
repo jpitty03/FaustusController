@@ -203,11 +203,15 @@ public sealed partial class FaustusController
             new Vector2(100, 360),
             SharpDX.Color.Orange);
         Graphics.DrawText(
-            _sdkProbeStatus,
+            _orderPlacementController.Status,
             new Vector2(100, 380),
+            SharpDX.Color.Red);
+        Graphics.DrawText(
+            _sdkProbeStatus,
+            new Vector2(100, 400),
             SharpDX.Color.Magenta);
 
-        RenderRouteAnalysis(390);
+        RenderRouteAnalysis(410);
 
         var panel = GameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
         if (panel.IsVisible)
@@ -233,6 +237,16 @@ public sealed partial class FaustusController
                     "CALIBRATED I HAVE",
                     offeredButton + new Vector2(6, -10),
                     SharpDX.Color.Magenta);
+            }
+
+            if (_pickerButtonCalibration.TryResolvePlaceOrder(
+                panelRectangle,
+                out var placeOrderButton))
+            {
+                Graphics.DrawText(
+                    "CALIBRATED PLACE ORDER",
+                    placeOrderButton + new Vector2(6, -10),
+                    SharpDX.Color.Red);
             }
         }
     }

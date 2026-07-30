@@ -12,6 +12,8 @@ public sealed class PickerButtonCalibrationData
     public DateTimeOffset UpdatedAtUtc { get; set; }
     public NormalizedPickerPoint? WantedButton { get; set; }
     public NormalizedPickerPoint? OfferedButton { get; set; }
+    // Optional (nullable) so schema version 1 files without it still load.
+    public NormalizedPickerPoint? PlaceOrderButton { get; set; }
 }
 
 public sealed class PickerButtonCalibrationController
@@ -37,7 +39,9 @@ public sealed class PickerButtonCalibrationController
     public void Start(GameController gameController)
     {
         var panel = gameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
-        Data = new PickerButtonCalibrationData();
+        // Recalibrating the picker buttons must not discard the separately
+        // captured Place Order point (F9).
+        Data = new PickerButtonCalibrationData { PlaceOrderButton = Data.PlaceOrderButton };
         IsArmed = true;
         IsDirty = false;
         _wasPickerVisible = panel.IsVisible && panel.CurrencyPicker.IsVisible;
@@ -69,7 +73,24 @@ public sealed class PickerButtonCalibrationController
         bool wantedButton,
         out Vector2 position)
     {
-        var point = wantedButton ? Data.WantedButton : Data.OfferedButton;
+        return TryResolvePoint(
+            wantedButton ? Data.WantedButton : Data.OfferedButton,
+            panelRectangle,
+            out position);
+    }
+
+    public bool TryResolvePlaceOrder(
+        SharpDX.RectangleF panelRectangle,
+        out Vector2 position)
+    {
+        return TryResolvePoint(Data.PlaceOrderButton, panelRectangle, out position);
+    }
+
+    private static bool TryResolvePoint(
+        NormalizedPickerPoint? point,
+        SharpDX.RectangleF panelRectangle,
+        out Vector2 position)
+    {
         if (point == null || panelRectangle.Width <= 0 || panelRectangle.Height <= 0)
         {
             position = default;
@@ -80,6 +101,40 @@ public sealed class PickerButtonCalibrationController
             panelRectangle.X + point.X * panelRectangle.Width,
             panelRectangle.Y + point.Y * panelRectangle.Height);
         return true;
+    }
+
+    public void CapturePlaceOrderButton(GameController gameController)
+    {
+        if (!gameController.Window.IsForeground())
+        {
+            Status = "Place-order calibration ignored: Path of Exile is not foreground.";
+            return;
+        }
+
+        var panel = gameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
+        if (!panel.IsVisible || panel.CurrencyPicker.IsVisible)
+        {
+            Status = "Place-order calibration ignored: the exchange panel must be " +
+                "visible with no open picker.";
+            return;
+        }
+
+        var rectangle = panel.GetClientRectCache;
+        var cursor = Input.MousePositionNum;
+        if (rectangle.Width <= 0 || rectangle.Height <= 0 ||
+            cursor.X < rectangle.X || cursor.X > rectangle.X + rectangle.Width ||
+            cursor.Y < rectangle.Y || cursor.Y > rectangle.Y + rectangle.Height)
+        {
+            Status = "Place-order calibration ignored: cursor is outside the panel rectangle.";
+            return;
+        }
+
+        Data.PlaceOrderButton = new NormalizedPickerPoint(
+            (cursor.X - rectangle.X) / rectangle.Width,
+            (cursor.Y - rectangle.Y) / rectangle.Height);
+        Data.UpdatedAtUtc = DateTimeOffset.UtcNow;
+        IsDirty = true;
+        Status = "Captured Place Order button; order placement can now click it.";
     }
 
     public void MarkSaved()

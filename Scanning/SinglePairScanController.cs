@@ -515,7 +515,7 @@ public sealed class SinglePairScanController
 
         Status = $"Stable rate {_lastRateGet}:{_lastRateGive}: " +
             $"sample {_stableRateSamples}/3.";
-        if (_stableRateSamples >= 3)
+        if (_stableRateSamples >= 3) // Bypass sample count for now to capture the first observed rate immediately
         {
             _capturedSnapshot = snapshot;
             State = SinglePairScanState.Completed;
