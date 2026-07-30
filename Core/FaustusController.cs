@@ -17,6 +17,7 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
     private readonly CurrencyAmountInputController _amountInputController = new();
     private readonly OrderStagingController _orderStagingController = new();
     private readonly OrderPlacementController _orderPlacementController = new();
+    private readonly SingleHopExecutionController _singleHopExecutionController = new();
     private readonly PickerButtonCalibrationController _pickerButtonCalibration = new();
     private readonly PickerButtonCalibrationStore _pickerButtonCalibrationStore = new();
     private readonly CalibratedPickerOpenController _pickerOpenController = new();
@@ -214,6 +215,8 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
         _amountInputController.Cancel("Order amount input cancelled after area change.");
         _orderStagingController.Cancel("Order staging cancelled after area change.");
         _orderPlacementController.Cancel("Order placement cancelled after area change.");
+        _singleHopExecutionController.Cancel(
+            "Single-hop execution cancelled after area change.");
         _marketDiscoveryDirty = true;
         _nextMarketDiscoveryRetryUtc = DateTimeOffset.UtcNow;
         _conversionGraphDirty = true;
@@ -300,6 +303,11 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
         if (Settings.PlaceOrderKey.PressedOnce())
         {
             StartOrderPlacement();
+        }
+
+        if (Settings.ExecuteHopKey.PressedOnce())
+        {
+            StartSingleHopExecution();
         }
 
         if (_orderStagingController.IsRunning && !AreOrderStagingPermissionsEnabled())
@@ -509,6 +517,10 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
         {
             ExportPlacedOrders();
         }
+
+        // Ticked after placement so a Completed order and its outcome are visible
+        // this frame; drains the finished execution's audit for persistence.
+        TickSingleHopExecution();
 
         var pendingProbe = _liquidityDiscoveryController.PendingProbe;
         if (pendingProbe != null && TryPersistDiscoveryProbe(pendingProbe))

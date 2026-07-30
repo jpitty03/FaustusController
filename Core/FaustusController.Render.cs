@@ -30,11 +30,14 @@ public sealed partial class FaustusController
             SharpDX.Color.White);
         y += 20;
 
+        var netLabel = route.IsCycle
+            ? $" | net: +{route.NetGainUnits} {route.TargetCurrency.Name}"
+            : "";
         Graphics.DrawText(
             $"{analysis.Request.StartAmount} {route.Hops.FirstOrDefault()?.OfferedCurrency.Name} " +
             $"-> {route.TargetUnits} {route.TargetCurrency.Name} " +
             $"in {route.HopCount} hops | gold: {route.TotalGoldCost} | " +
-            $"stranded: {route.StrandedRemainderCurrencyCount} currency",
+            $"stranded: {route.StrandedRemainderCurrencyCount} currency{netLabel}",
             new Vector2(x, y),
             SharpDX.Color.Cyan);
         y += 20;
@@ -207,17 +210,21 @@ public sealed partial class FaustusController
             new Vector2(100, 380),
             SharpDX.Color.Red);
         Graphics.DrawText(
-            _sdkProbeStatus,
+            _hopExecutionStatus,
             new Vector2(100, 400),
+            SharpDX.Color.Gold);
+        Graphics.DrawText(
+            _sdkProbeStatus,
+            new Vector2(100, 420),
             SharpDX.Color.Magenta);
         Graphics.DrawText(
             _tradablesStatus,
-            new Vector2(100, 420),
+            new Vector2(100, 440),
             _tradableCategories.NamedEntryCount > 0
                 ? SharpDX.Color.LightGreen
                 : SharpDX.Color.OrangeRed);
 
-        RenderRouteAnalysis(440);
+        RenderRouteAnalysis(460);
 
         var panel = GameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
         if (panel.IsVisible)

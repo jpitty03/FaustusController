@@ -48,6 +48,11 @@ public sealed class OrderPlacementController
     public OrderPlacementState State { get; private set; } = OrderPlacementState.Idle;
     public string Status { get; private set; } =
         "Order placement is disabled by default.";
+
+    // The verified placed order's economics, set once when placement reaches
+    // Completed and read by SingleHopExecutionController for its post-execution
+    // audit. Null until a matching new order is confirmed.
+    public PlacedOrderOutcome? Outcome { get; private set; }
     public bool IsRunning => State is OrderPlacementState.AwaitingStagedOrder or
         OrderPlacementState.MovingToButton or
         OrderPlacementState.ReadyToClick or
@@ -97,6 +102,7 @@ public sealed class OrderPlacementController
         _offeredAmount = 0;
         _wantedAmount = 0;
         _completedNotificationPending = false;
+        Outcome = null;
         State = OrderPlacementState.AwaitingStagedOrder;
         Status = "Order placement armed: waiting for staging to verify the order.";
         failureReason = string.Empty;
@@ -395,6 +401,17 @@ public sealed class OrderPlacementController
                     : order.IsCompleted
                         ? "Completed (filled)"
                         : "Pending";
+                Outcome = new PlacedOrderOutcome(
+                    order.PlayerOrderId,
+                    orderStatus,
+                    order.GoldCost,
+                    order.OriginalOfferedItemStackSize,
+                    order.OfferedItemStackSize,
+                    order.WantedItemStackSize,
+                    order.OfferedItemRatioPart,
+                    order.WantedItemRatioPart,
+                    order.IsCompleted,
+                    order.IsCanceled);
                 State = OrderPlacementState.Completed;
                 _completedNotificationPending = true;
                 Status = $"Order placed: {_offeredAmount} {_step.OfferedCurrency.Name} -> " +

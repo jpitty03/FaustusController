@@ -93,4 +93,12 @@ public sealed class FaustusControllerSettings : ISettings
     {
         IgnoreFocusedInput = true
     };
+    // Verified single-hop execution: F8 placement plus an explicit pre-execution
+    // rate gate and a post-execution actual-vs-expected audit. Requires every
+    // order-placement permission in addition to this toggle.
+    public ToggleNode AllowSingleHopExecution { get; set; } = new(false);
+    public HotkeyNodeV2 ExecuteHopKey { get; set; } = new(Keys.F10)
+    {
+        IgnoreFocusedInput = true
+    };
 }

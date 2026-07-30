@@ -50,6 +50,10 @@ public sealed class OrderStagingController
     public long OfferedAmount => _offeredAmount;
     public long WantedAmount => _wantedAmount;
 
+    // The top immediate market rate of the final staged capture, read by
+    // SingleHopExecutionController for its pre-execution rate gate. Null until Staged.
+    public RationalExchangeRate? StagedImmediateRate { get; private set; }
+
     // Forwarded to the inner scan controller so the host's single sample-count
     // setting reaches the staging pair scan too.
     public int StableRateSampleTarget
@@ -103,6 +107,7 @@ public sealed class OrderStagingController
         _wantedAmount = wantedAmount;
         _league = gameController.Game.IngameState.ServerData.League;
         _stagedSnapshot = null;
+        StagedImmediateRate = null;
         _lockInKeySent = false;
         State = OrderStagingState.SelectingPair;
         Status = $"Staging order (dry run): {step.OfferedCurrency.Name} " +
@@ -478,6 +483,7 @@ public sealed class OrderStagingController
             return;
         }
 
+        StagedImmediateRate = finalSnapshot!.TopImmediateRate;
         State = OrderStagingState.Staged;
         Status = $"DRY RUN staged: {_step!.OfferedCurrency.Name} {_offeredAmount} -> " +
             $"{_step.WantedCurrency.Name} {_wantedAmount}; amounts locked in, the " +

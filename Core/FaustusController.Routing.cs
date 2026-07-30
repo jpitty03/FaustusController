@@ -50,14 +50,29 @@ public sealed partial class FaustusController
                 _routeRequestPath,
                 _routeAnalysisPath,
                 DateTimeOffset.UtcNow);
-            _routeAnalysisStatus = result.RouteFound
-                ? $"Route analysis: best output {result.BestTargetUnits}; " +
-                    $"{result.CandidateRouteCount} candidates, {result.FreshEdgeCount} fresh edges" +
-                    (result.SearchTruncated ? "; SEARCH TRUNCATED." : ".") +
-                    FormatRouteConstraints(result)
-                : $"Route analysis found no executable whole-unit route across " +
-                    $"{result.FreshEdgeCount} fresh edges; {result.ExpiredEdgeCount} expired." +
-                    FormatRouteConstraints(result);
+            if (result.CycleMode)
+            {
+                _routeAnalysisStatus = result.RouteFound
+                    ? $"Route analysis: best loop +{result.BestNetGainUnits} net " +
+                        $"({result.BestTargetUnits} returned); " +
+                        $"{result.CandidateRouteCount} loops, {result.FreshEdgeCount} fresh edges" +
+                        (result.SearchTruncated ? "; SEARCH TRUNCATED." : ".") +
+                        FormatRouteConstraints(result)
+                    : $"Route analysis found no profitable loop across " +
+                        $"{result.FreshEdgeCount} fresh edges; {result.ExpiredEdgeCount} expired." +
+                        FormatRouteConstraints(result);
+            }
+            else
+            {
+                _routeAnalysisStatus = result.RouteFound
+                    ? $"Route analysis: best output {result.BestTargetUnits}; " +
+                        $"{result.CandidateRouteCount} candidates, {result.FreshEdgeCount} fresh edges" +
+                        (result.SearchTruncated ? "; SEARCH TRUNCATED." : ".") +
+                        FormatRouteConstraints(result)
+                    : $"Route analysis found no executable whole-unit route across " +
+                        $"{result.FreshEdgeCount} fresh edges; {result.ExpiredEdgeCount} expired." +
+                        FormatRouteConstraints(result);
+            }
 
             try
             {
@@ -119,8 +134,11 @@ public sealed partial class FaustusController
             ? (_routeDisplayIndex - 1 + count) % count
             : (_routeDisplayIndex + 1) % count;
         var route = _lastRouteAnalysis.Routes[_routeDisplayIndex];
-        _routeAnalysisStatus = $"Route {route.Rank}/{count}: " +
-            $"{route.TargetUnits} {route.TargetCurrency.Name} in {route.HopCount} hops " +
+        var yield = route.IsCycle
+            ? $"+{route.NetGainUnits} net {route.TargetCurrency.Name} " +
+                $"({route.ReturnedStartUnits} returned)"
+            : $"{route.TargetUnits} {route.TargetCurrency.Name}";
+        _routeAnalysisStatus = $"Route {route.Rank}/{count}: {yield} in {route.HopCount} hops " +
             $"(gold {route.TotalGoldCost}, stranded {route.StrandedRemainderCurrencyCount}).";
     }
 

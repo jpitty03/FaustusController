@@ -16,6 +16,7 @@ public sealed class CurrencyRouteRequestFile
     public bool UseLiquidityLimits { get; set; }
     public long GoldCostPerHop { get; set; }
     public long GoldBudget { get; set; }
+    public bool RequireProfit { get; set; }
 }
 
 public sealed class CurrencyRouteAnalysisFile
@@ -39,6 +40,8 @@ public sealed class CurrencyRouteAnalysisFile
     public bool UsesInventoryBalances { get; set; }
     public bool UsesLiquidityLimits { get; set; }
     public bool UsesGoldCosts { get; set; }
+    public bool CycleMode { get; set; }
+    public bool RequireProfit { get; set; }
     public string Ranking { get; set; } = "";
     public CurrencyRouteCapture? BestRoute { get; set; }
     public List<CurrencyRouteCapture> Routes { get; set; } = [];
@@ -49,6 +52,10 @@ public sealed class CurrencyRouteCapture
     public int Rank { get; set; }
     public CurrencyCapture TargetCurrency { get; set; } = new();
     public long TargetUnits { get; set; }
+    public bool IsCycle { get; set; }
+    public long ReturnedStartUnits { get; set; }
+    public long NetGainUnits { get; set; }
+    public bool Profitable { get; set; }
     public int HopCount { get; set; }
     public int StrandedRemainderCurrencyCount { get; set; }
     public long TotalGoldCost { get; set; }

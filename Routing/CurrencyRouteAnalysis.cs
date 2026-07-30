@@ -12,12 +12,14 @@ public readonly record struct CurrencyRouteAnalysisResult(
     long? BestTargetUnits,
     bool UsesInventoryBalances,
     bool UsesLiquidityLimits,
-    bool UsesGoldCosts);
+    bool UsesGoldCosts,
+    bool CycleMode,
+    long? BestNetGainUnits);
 
 public sealed class CurrencyRouteAnalyzer
 {
-    private const int CurrentRequestSchemaVersion = 2;
-    private const int CurrentAnalysisSchemaVersion = 2;
+    private const int CurrentRequestSchemaVersion = 3;
+    private const int CurrentAnalysisSchemaVersion = 3;
     private const int SupportedGraphSchemaVersion = 1;
 
     public CurrencyRouteRequestFile LoadOrCreateRequest(
@@ -27,11 +29,10 @@ public sealed class CurrencyRouteAnalyzer
     {
         if (!File.Exists(requestPath))
         {
-            if (!catalogue.TryGetUniqueByName("Chaos Orb", out var chaos) ||
-                !catalogue.TryGetUniqueByName("Divine Orb", out var divine))
+            if (!catalogue.TryGetUniqueByName("Chaos Orb", out var chaos))
             {
                 throw new InvalidDataException(
-                    "Default route request requires unique Chaos Orb and Divine Orb identities.");
+                    "Default route request requires a unique Chaos Orb identity.");
             }
 
             var request = new CurrencyRouteRequestFile
@@ -40,10 +41,11 @@ public sealed class CurrencyRouteAnalyzer
                 League = league,
                 StartCurrency = CreateCurrency(chaos!),
                 StartAmount = 5000,
-                TargetCurrency = CreateCurrency(divine!),
+                TargetCurrency = CreateCurrency(chaos!),
                 MaximumHops = 3,
                 MaximumResults = 10,
-                MaximumExpandedStates = 100000
+                MaximumExpandedStates = 100000,
+                RequireProfit = true
             };
             WriteAtomically(requestPath, request);
         }
@@ -52,8 +54,10 @@ public sealed class CurrencyRouteAnalyzer
             File.ReadAllText(requestPath)) ??
             throw new InvalidDataException("The route request file is empty.");
 
-        if (loaded.SchemaVersion == 1)
+        if (loaded.SchemaVersion is 1 or 2)
         {
+            // v1->v2 added gold/liquidity fields; v2->v3 added RequireProfit.
+            // Pre-existing files default RequireProfit off, preserving acyclic behavior.
             loaded.SchemaVersion = CurrentRequestSchemaVersion;
             WriteAtomically(requestPath, loaded);
         }
@@ -121,6 +125,10 @@ public sealed class CurrencyRouteAnalyzer
                     .ThenBy(edge => edge.BookSide, StringComparer.Ordinal)
                     .ToArray(),
                 StringComparer.Ordinal);
+        var cycleMode = string.Equals(
+            request.StartCurrency.Metadata,
+            request.TargetCurrency.Metadata,
+            StringComparison.Ordinal);
         var search = new RouteSearchState(request.MaximumExpandedStates);
         var rankedRoutes = new List<RouteCandidate>();
         var visited = new HashSet<string>(StringComparer.Ordinal)
@@ -148,16 +156,14 @@ public sealed class CurrencyRouteAnalyzer
             [],
             0,
             constraints,
+            cycleMode,
+            request.RequireProfit,
+            request.StartAmount,
             search,
             rankedRoutes,
             request.MaximumResults);
 
-        var orderedRoutes = rankedRoutes
-            .OrderByDescending(route => route.TargetUnits)
-            .ThenBy(route => route.TotalGoldCost)
-            .ThenBy(route => route.Remainders.Count(remainder => remainder.Units > 0))
-            .ThenBy(route => route.Hops.Count)
-            .ThenBy(route => route.PathKey, StringComparer.Ordinal)
+        var orderedRoutes = OrderRoutes(rankedRoutes)
             .Take(request.MaximumResults)
             .ToArray();
         var analysis = new CurrencyRouteAnalysisFile
@@ -181,8 +187,13 @@ public sealed class CurrencyRouteAnalyzer
             UsesInventoryBalances = request.InventoryBalances.Count > 0,
             UsesLiquidityLimits = request.UseLiquidityLimits,
             UsesGoldCosts = request.GoldCostPerHop > 0 || request.GoldBudget > 0,
-            Ranking = "Maximum target units, then lower total gold cost, " +
-                "fewer stranded remainder currencies, fewer hops, deterministic path",
+            CycleMode = cycleMode,
+            RequireProfit = request.RequireProfit,
+            Ranking = cycleMode
+                ? "Maximum net start-currency gain, then lower total gold cost, " +
+                    "fewer stranded remainder currencies, fewer hops, deterministic path"
+                : "Maximum target units, then lower total gold cost, " +
+                    "fewer stranded remainder currencies, fewer hops, deterministic path",
             Routes = orderedRoutes.Select((route, index) => CreateRouteCapture(
                 index + 1,
                 route,
@@ -201,7 +212,9 @@ public sealed class CurrencyRouteAnalyzer
             analysis.BestRoute?.TargetUnits,
             analysis.UsesInventoryBalances,
             analysis.UsesLiquidityLimits,
-            analysis.UsesGoldCosts);
+            analysis.UsesGoldCosts,
+            cycleMode,
+            cycleMode ? analysis.BestRoute?.NetGainUnits : null);
     }
 
     private static void Search(
@@ -215,6 +228,9 @@ public sealed class CurrencyRouteAnalyzer
         IReadOnlyList<RouteRemainder> remainders,
         long totalGold,
         RouteConstraints constraints,
+        bool isCycle,
+        bool requireProfit,
+        long startAmount,
         RouteSearchState search,
         ICollection<RouteCandidate> routes,
         int maximumResults)
@@ -250,7 +266,10 @@ public sealed class CurrencyRouteAnalyzer
             }
 
             search.ExpandedStateCount++;
-            if (visited.Contains(edge.WantedMetadata))
+            // Returning to the start is the terminal hop of a cycle (target == start), so exempt
+            // the target from cycle rejection; every other revisit is still a rejected cycle.
+            // In acyclic mode the target is never in `visited`, so this is a no-op there.
+            if (edge.WantedMetadata != targetMetadata && visited.Contains(edge.WantedMetadata))
             {
                 search.RejectedCycleCount++;
                 continue;
@@ -337,14 +356,41 @@ public sealed class CurrencyRouteAnalyzer
             if (edge.WantedMetadata == targetMetadata)
             {
                 search.CandidateRouteCount++;
-                routes.Add(new RouteCandidate(
-                    received,
-                    nextTotalGold,
-                    nextHops,
-                    nextRemainders,
-                    string.Join(">", nextHops.Select(hop =>
-                        $"{hop.Edge.OfferedMetadata}:{hop.Edge.WantedMetadata}"))));
-                TrimRoutes(routes, maximumResults);
+
+                // For a cycle, leftover start currency from the first hop is still held, so the
+                // real return is the terminal received plus any start-currency remainder.
+                long returnedStart;
+                try
+                {
+                    var startRemainder = isCycle
+                        ? nextRemainders
+                            .Where(remainder => remainder.Metadata == targetMetadata)
+                            .Sum(remainder => remainder.Units)
+                        : 0;
+                    returnedStart = isCycle ? checked(received + startRemainder) : received;
+                }
+                catch (OverflowException)
+                {
+                    search.RejectedOverflowCount++;
+                    continue;
+                }
+
+                var netGain = isCycle ? returnedStart - startAmount : 0;
+                if (!isCycle || !requireProfit || netGain > 0)
+                {
+                    routes.Add(new RouteCandidate(
+                        received,
+                        returnedStart,
+                        netGain,
+                        isCycle,
+                        nextTotalGold,
+                        nextHops,
+                        nextRemainders,
+                        string.Join(">", nextHops.Select(hop =>
+                            $"{hop.Edge.OfferedMetadata}:{hop.Edge.WantedMetadata}"))));
+                    TrimRoutes(routes, maximumResults);
+                }
+
                 continue;
             }
 
@@ -360,6 +406,9 @@ public sealed class CurrencyRouteAnalyzer
                 nextRemainders,
                 nextTotalGold,
                 constraints,
+                isCycle,
+                requireProfit,
+                startAmount,
                 search,
                 routes,
                 maximumResults);
@@ -374,12 +423,7 @@ public sealed class CurrencyRouteAnalyzer
             return;
         }
 
-        var retained = routes
-            .OrderByDescending(route => route.TargetUnits)
-            .ThenBy(route => route.TotalGoldCost)
-            .ThenBy(route => route.Remainders.Count(remainder => remainder.Units > 0))
-            .ThenBy(route => route.Hops.Count)
-            .ThenBy(route => route.PathKey, StringComparer.Ordinal)
+        var retained = OrderRoutes(routes)
             .Take(maximumResults * 2)
             .ToArray();
         routes.Clear();
@@ -387,6 +431,20 @@ public sealed class CurrencyRouteAnalyzer
         {
             routes.Add(route);
         }
+    }
+
+    // A cycle's objective is net start-currency gain (its Objective returns ReturnedStartUnits);
+    // an acyclic route's objective is raw target units. Shared by mid-search trimming and the
+    // final ranking so both agree.
+    private static IOrderedEnumerable<RouteCandidate> OrderRoutes(
+        IEnumerable<RouteCandidate> routes)
+    {
+        return routes
+            .OrderByDescending(route => route.Objective)
+            .ThenBy(route => route.TotalGoldCost)
+            .ThenBy(route => route.Remainders.Count(remainder => remainder.Units > 0))
+            .ThenBy(route => route.Hops.Count)
+            .ThenBy(route => route.PathKey, StringComparer.Ordinal);
     }
 
     private static CurrencyRouteCapture CreateRouteCapture(
@@ -400,6 +458,10 @@ public sealed class CurrencyRouteAnalyzer
             Rank = rank,
             TargetCurrency = targetCurrency,
             TargetUnits = route.TargetUnits,
+            IsCycle = route.IsCycle,
+            ReturnedStartUnits = route.IsCycle ? route.ReturnedStartUnits : 0,
+            NetGainUnits = route.IsCycle ? route.NetGainUnits : 0,
+            Profitable = route.IsCycle && route.NetGainUnits > 0,
             HopCount = route.Hops.Count,
             StrandedRemainderCurrencyCount = route.Remainders.Count(
                 remainder => remainder.Units > 0),
@@ -445,7 +507,10 @@ public sealed class CurrencyRouteAnalyzer
             request.MaximumExpandedStates is < 1000 or > 1000000 ||
             string.IsNullOrWhiteSpace(request.StartCurrency.Metadata) ||
             string.IsNullOrWhiteSpace(request.TargetCurrency.Metadata) ||
-            request.StartCurrency.Metadata == request.TargetCurrency.Metadata ||
+            // A cycle (start == target) is allowed but needs >= 2 hops to close the loop;
+            // start != target remains the acyclic Start->Target search.
+            (request.StartCurrency.Metadata == request.TargetCurrency.Metadata &&
+                request.MaximumHops < 2) ||
             !catalogue.TryGetByMetadata(request.StartCurrency.Metadata, out _) ||
             !catalogue.TryGetByMetadata(request.TargetCurrency.Metadata, out _) ||
             request.GoldCostPerHop < 0 || request.GoldBudget < 0)
@@ -560,8 +625,14 @@ public sealed class CurrencyRouteAnalyzer
 
     private sealed record RouteCandidate(
         long TargetUnits,
+        long ReturnedStartUnits,
+        long NetGainUnits,
+        bool IsCycle,
         long TotalGoldCost,
         IReadOnlyList<RouteHop> Hops,
         IReadOnlyList<RouteRemainder> Remainders,
-        string PathKey);
+        string PathKey)
+    {
+        public long Objective => IsCycle ? ReturnedStartUnits : TargetUnits;
+    }
 }

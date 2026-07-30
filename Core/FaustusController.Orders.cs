@@ -423,54 +423,70 @@ public sealed partial class FaustusController
             return;
         }
 
-        if (_catalogue == null)
+        if (!TryBuildSelectedFirstHopStep(out var hop, out var step, out var failure))
         {
-            _orderStagingController.Cancel(
-                "Order staging blocked: the currency catalogue is not ready.");
+            _orderStagingController.Cancel($"Order staging blocked: {failure}");
             return;
         }
 
-        var analysis = _lastRouteAnalysis;
-        if (analysis == null || analysis.Routes.Count == 0)
-        {
-            _orderStagingController.Cancel(
-                "Order staging blocked: run route analysis (Home) first.");
-            return;
-        }
-
-        var routeIndex = Math.Clamp(_routeDisplayIndex, 0, analysis.Routes.Count - 1);
-        var route = analysis.Routes[routeIndex];
-        if (route.Hops.Count == 0)
-        {
-            _orderStagingController.Cancel(
-                "Order staging blocked: the selected route has no hops.");
-            return;
-        }
-
-        var hop = route.Hops[0];
-        if (!_catalogue.TryGetByMetadata(hop.OfferedCurrency.Metadata, out var offered) ||
-            offered == null)
-        {
-            _orderStagingController.Cancel(
-                $"Order staging blocked: '{hop.OfferedCurrency.Name}' is not in the catalogue.");
-            return;
-        }
-
-        if (!_catalogue.TryGetByMetadata(hop.WantedCurrency.Metadata, out var wanted) ||
-            wanted == null)
-        {
-            _orderStagingController.Cancel(
-                $"Order staging blocked: '{hop.WantedCurrency.Name}' is not in the catalogue.");
-            return;
-        }
-
-        var step = new CurrencyScanPlanStep(0, offered, wanted);
         _ = _orderStagingController.Start(
             GameController,
             step,
             hop.Spent,
             hop.Received,
             out _);
+    }
+
+    // Resolves the currently-selected analysis route's first hop into a scan-plan
+    // step, shared by the F6 staging dry run and F10 single-hop execution. Failure
+    // reasons are neutral so each caller can prefix them with its own context.
+    private bool TryBuildSelectedFirstHopStep(
+        out CurrencyRouteHopCapture hop,
+        out CurrencyScanPlanStep step,
+        out string failureReason)
+    {
+        hop = null!;
+        step = null!;
+        if (_catalogue == null)
+        {
+            failureReason = "the currency catalogue is not ready.";
+            return false;
+        }
+
+        var analysis = _lastRouteAnalysis;
+        if (analysis == null || analysis.Routes.Count == 0)
+        {
+            failureReason = "run route analysis (Home) first.";
+            return false;
+        }
+
+        var routeIndex = Math.Clamp(_routeDisplayIndex, 0, analysis.Routes.Count - 1);
+        var route = analysis.Routes[routeIndex];
+        if (route.Hops.Count == 0)
+        {
+            failureReason = "the selected route has no hops.";
+            return false;
+        }
+
+        var first = route.Hops[0];
+        if (!_catalogue.TryGetByMetadata(first.OfferedCurrency.Metadata, out var offered) ||
+            offered == null)
+        {
+            failureReason = $"'{first.OfferedCurrency.Name}' is not in the catalogue.";
+            return false;
+        }
+
+        if (!_catalogue.TryGetByMetadata(first.WantedCurrency.Metadata, out var wanted) ||
+            wanted == null)
+        {
+            failureReason = $"'{first.WantedCurrency.Name}' is not in the catalogue.";
+            return false;
+        }
+
+        hop = first;
+        step = new CurrencyScanPlanStep(0, offered, wanted);
+        failureReason = string.Empty;
+        return true;
     }
 
     private void StartOrderPlacement()

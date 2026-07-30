@@ -203,7 +203,8 @@ public sealed partial class FaustusController
         _boundedScanController.IsRunning ||
         _liquidityDiscoveryController.IsRunning ||
         _orderStagingController.IsRunning ||
-        _orderPlacementController.IsRunning;
+        _orderPlacementController.IsRunning ||
+        _singleHopExecutionController.IsRunning;
 
     private void CancelSinglePairAutomation(string reason)
     {

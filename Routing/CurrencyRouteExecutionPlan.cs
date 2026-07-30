@@ -10,7 +10,7 @@ public readonly record struct RouteExecutionPlanResult(
 
 public sealed class CurrencyRouteExecutionPlanExporter
 {
-    private const int CurrentSchemaVersion = 1;
+    private const int CurrentSchemaVersion = 2;
 
     public RouteExecutionPlanResult Export(
         CurrencyCatalogue catalogue,
@@ -87,6 +87,9 @@ public sealed class CurrencyRouteExecutionPlanExporter
             StartAmount = analysis.Request.StartAmount,
             TargetCurrency = route.TargetCurrency,
             ExpectedTargetUnits = route.TargetUnits,
+            IsCycle = route.IsCycle,
+            ReturnedStartUnits = route.ReturnedStartUnits,
+            NetGainUnits = route.NetGainUnits,
             TotalGoldCost = route.TotalGoldCost,
             HopCount = route.HopCount,
             UsesInventoryBalances = analysis.UsesInventoryBalances,
@@ -147,6 +150,10 @@ public sealed class CurrencyRouteExecutionPlanExporter
                 "Route execution plan root metadata is invalid.");
         }
 
+        var isCycle = string.Equals(
+            file.StartCurrency.Metadata,
+            file.TargetCurrency.Metadata,
+            StringComparison.Ordinal);
         var visitedCurrencies = new HashSet<string>(StringComparer.Ordinal);
         var previousWanted = file.StartCurrency.Metadata;
         visitedCurrencies.Add(previousWanted);
@@ -154,6 +161,13 @@ public sealed class CurrencyRouteExecutionPlanExporter
         for (var i = 0; i < file.Steps.Count; i++)
         {
             var step = file.Steps[i];
+            // A cycle plan's final step returns to the start; every other step must reach a
+            // currency not yet visited. Intermediate revisits remain invalid in both modes.
+            var closesCycle = isCycle && i == file.Steps.Count - 1 &&
+                string.Equals(
+                    step.WantedCurrency.Metadata,
+                    file.StartCurrency.Metadata,
+                    StringComparison.Ordinal);
             if (step.Sequence != i + 1 ||
                 string.IsNullOrWhiteSpace(step.OfferedCurrency.Metadata) ||
                 string.IsNullOrWhiteSpace(step.WantedCurrency.Metadata) ||
@@ -161,7 +175,7 @@ public sealed class CurrencyRouteExecutionPlanExporter
                 !catalogue.TryGetByMetadata(step.OfferedCurrency.Metadata, out _) ||
                 !catalogue.TryGetByMetadata(step.WantedCurrency.Metadata, out _) ||
                 step.OfferedCurrency.Metadata == step.WantedCurrency.Metadata ||
-                !visitedCurrencies.Add(step.WantedCurrency.Metadata) ||
+                (!closesCycle && !visitedCurrencies.Add(step.WantedCurrency.Metadata)) ||
                 step.GiveUnitsPerLot <= 0 || step.GetUnitsPerLot <= 0 ||
                 step.ExpectedLots <= 0 || step.ExpectedSpent <= 0 ||
                 step.ExpectedReceived <= 0 || step.ExpectedRemainder < 0 ||
@@ -195,6 +209,9 @@ public sealed class RouteExecutionPlanFile
     public long StartAmount { get; set; }
     public CurrencyCapture TargetCurrency { get; set; } = new();
     public long ExpectedTargetUnits { get; set; }
+    public bool IsCycle { get; set; }
+    public long ReturnedStartUnits { get; set; }
+    public long NetGainUnits { get; set; }
     public long TotalGoldCost { get; set; }
     public int HopCount { get; set; }
     public bool UsesInventoryBalances { get; set; }
