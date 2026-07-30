@@ -60,6 +60,9 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
     private string _discoveryOverridePath = "";
     private string _discoveryOverrideLeague = "";
     private CurrencyDiscoveryOverrides _discoveryOverrides = CurrencyDiscoveryOverrides.Empty;
+    private string _discoveryCategorySignature = "";
+    private TradableCategoryResolver _tradableCategories = TradableCategoryResolver.Empty;
+    private string _tradablesStatus = "Tradables category list not loaded yet.";
     private bool _activeRefreshRun;
     private string _exportStatus = "";
     private string _marketDiscoveryStatus = "Active-market discovery is waiting for the live catalogue.";
@@ -129,7 +132,73 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
                 $"Picker-button calibration load failed: {exception.Message}");
         }
 
+        try
+        {
+            var tradablesPath = FindTradablesPath();
+            if (tradablesPath.Length == 0)
+            {
+                _tradablesStatus =
+                    "Tradables list NOT found (tradables.json / tradables.txt); every " +
+                    "currency is 'Other'. Place tradables.json in the plugin folder.";
+            }
+            else
+            {
+                _tradableCategories = TradableCategoryResolver.Load(tradablesPath);
+                _tradablesStatus =
+                    $"Tradables loaded ({_tradableCategories.NamedEntryCount}): " +
+                    $"Div {_tradableCategories.CountFor(TradableCategory.DivinationCards)}, " +
+                    $"Cur {_tradableCategories.CountFor(TradableCategory.Currency)}, " +
+                    $"Deli {_tradableCategories.CountFor(TradableCategory.DeliriumOrbs)}, " +
+                    $"Scar {_tradableCategories.CountFor(TradableCategory.Scarabs)}, " +
+                    $"Foss {_tradableCategories.CountFor(TradableCategory.Fossils)}, " +
+                    $"Ess {_tradableCategories.CountFor(TradableCategory.Essences)} " +
+                    $"from {Path.GetFileName(tradablesPath)}.";
+            }
+        }
+        catch (Exception exception)
+        {
+            // Everything falls to 'Other' when the list cannot be parsed.
+            _tradableCategories = TradableCategoryResolver.Empty;
+            _tradablesStatus = $"Tradables load FAILED: {exception.Message}";
+        }
+
         return true;
+    }
+
+    // tradables.json (preferred) or tradables.txt, searched next to the plugin
+    // and up its directory tree, then next to the config directory. The plugin's
+    // runtime folder is not always where the source lives, so several roots are
+    // probed rather than assuming DirectoryFullName.
+    private string FindTradablesPath()
+    {
+        var roots = new List<string>();
+        void AddRootChain(string? start)
+        {
+            var directory = string.IsNullOrEmpty(start) ? null : new DirectoryInfo(start);
+            for (var depth = 0; directory != null && depth < 6; depth++)
+            {
+                roots.Add(directory.FullName);
+                directory = directory.Parent;
+            }
+        }
+
+        AddRootChain(DirectoryFullName);
+        AddRootChain(ConfigDirectory);
+        AddRootChain(AppContext.BaseDirectory);
+
+        foreach (var fileName in new[] { "tradables.json", "tradables.txt" })
+        {
+            foreach (var root in roots)
+            {
+                var candidate = Path.Combine(root, fileName);
+                if (File.Exists(candidate))
+                {
+                    return candidate;
+                }
+            }
+        }
+
+        return "";
     }
 
     public override void AreaChange(AreaInstance area)
@@ -155,6 +224,13 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
     public override Job Tick()
     {
         EnsureMarketDiscoveryCatalogue();
+        // One setting, every scan controller: the standalone one plus each that
+        // owns its own inner SinglePairScanController (discovery, bounded, staging).
+        var stableRateSampleTarget = Settings.StableRateSampleCount.Value;
+        _singlePairScanController.StableRateSampleTarget = stableRateSampleTarget;
+        _liquidityDiscoveryController.StableRateSampleTarget = stableRateSampleTarget;
+        _boundedScanController.StableRateSampleTarget = stableRateSampleTarget;
+        _orderStagingController.StableRateSampleTarget = stableRateSampleTarget;
 
         if (Settings.RunLiquidityDiscoveryAutomation.PressedOnce())
         {

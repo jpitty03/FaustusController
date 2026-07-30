@@ -210,8 +210,14 @@ public sealed partial class FaustusController
             _sdkProbeStatus,
             new Vector2(100, 400),
             SharpDX.Color.Magenta);
+        Graphics.DrawText(
+            _tradablesStatus,
+            new Vector2(100, 420),
+            _tradableCategories.NamedEntryCount > 0
+                ? SharpDX.Color.LightGreen
+                : SharpDX.Color.OrangeRed);
 
-        RenderRouteAnalysis(410);
+        RenderRouteAnalysis(440);
 
         var panel = GameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
         if (panel.IsVisible)

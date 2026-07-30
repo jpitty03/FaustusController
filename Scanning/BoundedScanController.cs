@@ -66,6 +66,14 @@ public sealed class BoundedScanController
     public ExchangePairSnapshot? PendingSnapshot =>
         State == BoundedScanState.AwaitingPersistence ? _pendingSnapshot : null;
 
+    // Forwarded to the inner scan controller so the host's single sample-count
+    // setting reaches bounded scans too.
+    public int StableRateSampleTarget
+    {
+        get => _pairController.StableRateSampleTarget;
+        set => _pairController.StableRateSampleTarget = value;
+    }
+
     public bool Start(
         GameController gameController,
         IReadOnlyList<CurrencyScanPlanStep> collectionSteps,

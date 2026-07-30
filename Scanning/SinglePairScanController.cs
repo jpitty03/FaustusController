@@ -59,6 +59,9 @@ public sealed class SinglePairScanController
         not SinglePairScanState.Completed and
         not SinglePairScanState.Faulted;
     public SinglePairScanFailureKind FailureKind { get; private set; }
+    // Owned by FaustusController.Tick from Settings.StableRateSampleCount;
+    // clamped defensively so a bad value can never stall a capture forever.
+    public int StableRateSampleTarget { get; set; } = 3;
 
     public bool Start(
         GameController gameController,
@@ -419,7 +422,10 @@ public sealed class SinglePairScanController
             _rateDeadlineUtc = DateTimeOffset.UtcNow + RateTimeout;
             _nextRatePollAtUtc = DateTimeOffset.UtcNow + RateSettleDelay;
             State = SinglePairScanState.WaitingForStableRate;
-            Status = "Both currencies verified; waiting for three stable market-rate samples.";
+            var sampleTarget = Math.Clamp(StableRateSampleTarget, 1, 5);
+            Status = sampleTarget == 1
+                ? "Both currencies verified; waiting for one stable market-rate sample."
+                : $"Both currencies verified; waiting for {sampleTarget} stable market-rate samples.";
             return;
         }
 
@@ -452,7 +458,9 @@ public sealed class SinglePairScanController
 
         if (now >= _rateDeadlineUtc)
         {
-            Cancel("Stable-rate capture timed out before three identical samples.");
+            Cancel(
+                $"Stable-rate capture timed out before {Math.Clamp(StableRateSampleTarget, 1, 5)} " +
+                "identical samples.");
             return;
         }
 
@@ -513,9 +521,10 @@ public sealed class SinglePairScanController
             _stableRateSamples = 1;
         }
 
+        var sampleTarget = Math.Clamp(StableRateSampleTarget, 1, 5);
         Status = $"Stable rate {_lastRateGet}:{_lastRateGive}: " +
-            $"sample {_stableRateSamples}/3.";
-        if (_stableRateSamples >= 3) // Bypass sample count for now to capture the first observed rate immediately
+            $"sample {_stableRateSamples}/{sampleTarget}.";
+        if (_stableRateSamples >= sampleTarget)
         {
             _capturedSnapshot = snapshot;
             State = SinglePairScanState.Completed;

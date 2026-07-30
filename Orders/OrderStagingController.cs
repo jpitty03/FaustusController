@@ -50,6 +50,14 @@ public sealed class OrderStagingController
     public long OfferedAmount => _offeredAmount;
     public long WantedAmount => _wantedAmount;
 
+    // Forwarded to the inner scan controller so the host's single sample-count
+    // setting reaches the staging pair scan too.
+    public int StableRateSampleTarget
+    {
+        get => _pairController.StableRateSampleTarget;
+        set => _pairController.StableRateSampleTarget = value;
+    }
+
     public bool Start(
         GameController gameController,
         CurrencyScanPlanStep step,

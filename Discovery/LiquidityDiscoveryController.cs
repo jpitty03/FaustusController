@@ -49,6 +49,14 @@ public sealed class LiquidityDiscoveryController
     public PendingDiscoveryProbe? PendingProbe =>
         State == LiquidityDiscoveryState.AwaitingPersistence ? _pendingProbe : null;
 
+    // Forwarded to the inner scan controller so the host's single sample-count
+    // setting reaches discovery scans too.
+    public int StableRateSampleTarget
+    {
+        get => _pairController.StableRateSampleTarget;
+        set => _pairController.StableRateSampleTarget = value;
+    }
+
     public bool Start(
         GameController gameController,
         IReadOnlyList<CurrencyScanPlanStep> steps,

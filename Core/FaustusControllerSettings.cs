@@ -16,6 +16,19 @@ public sealed class FaustusControllerSettings : ISettings
     public ToggleNode AllowOrderAmountInput { get; set; } = new(false);
     public RangeNode<int> MaximumQuoteAgeMinutes { get; set; } = new(15, 1, 1440);
     public RangeNode<int> CursorTweenSpeed { get; set; } = new(1600, 400, 4000);
+    // How many consecutive identical rate reads a single-pair scan needs
+    // before capturing. 1 captures the first observed rate immediately.
+    public RangeNode<int> StableRateSampleCount { get; set; } = new(3, 1, 5);
+    // Tradable categories included in discovery/scanning. Disabling a category
+    // acts like ForceSkip for every catalogue item in it, except Chaos Orb and
+    // Divine Orb (pivots) and anything manually listed in ForceInclude.
+    public ToggleNode IncludeDivinationCards { get; set; } = new(true);
+    public ToggleNode IncludeCurrency { get; set; } = new(true);
+    public ToggleNode IncludeDeliriumOrbs { get; set; } = new(true);
+    public ToggleNode IncludeScarabs { get; set; } = new(true);
+    public ToggleNode IncludeFossils { get; set; } = new(true);
+    public ToggleNode IncludeEssences { get; set; } = new(true);
+    public ToggleNode IncludeOtherTradables { get; set; } = new(true);
     public HotkeyNodeV2 RunRouteAnalysis { get; set; } = new(Keys.Home)
     {
         IgnoreFocusedInput = true

@@ -470,9 +470,13 @@ public sealed partial class FaustusController
             return false;
         }
 
+        var categorySignature = GetTradableCategorySignature();
         if (!forceReload && string.Equals(
             _discoveryOverrideLeague,
             league,
+            StringComparison.Ordinal) && string.Equals(
+            _discoveryCategorySignature,
+            categorySignature,
             StringComparison.Ordinal))
         {
             return true;
@@ -481,7 +485,8 @@ public sealed partial class FaustusController
         try
         {
             var path = GetDiscoveryOverridePath(league);
-            var loaded = _discoveryOverrideStore.LoadOrCreate(path, league, _catalogue);
+            var manual = _discoveryOverrideStore.LoadOrCreate(path, league, _catalogue);
+            var loaded = ApplyCategoryFilters(manual);
             var changed = !string.Equals(
                     _discoveryOverrideLeague,
                     league,
@@ -519,6 +524,7 @@ public sealed partial class FaustusController
 
             _discoveryOverridePath = path;
             _discoveryOverrideLeague = league;
+            _discoveryCategorySignature = categorySignature;
             _discoveryOverrides = loaded;
 
             return true;
@@ -528,6 +534,63 @@ public sealed partial class FaustusController
             _marketDiscoveryStatus = $"Discovery overrides failed: {exception.Message}";
             return false;
         }
+    }
+
+    private bool IsTradableCategoryIncluded(TradableCategory category)
+    {
+        return category switch
+        {
+            TradableCategory.DivinationCards => Settings.IncludeDivinationCards.Value,
+            TradableCategory.Currency => Settings.IncludeCurrency.Value,
+            TradableCategory.DeliriumOrbs => Settings.IncludeDeliriumOrbs.Value,
+            TradableCategory.Scarabs => Settings.IncludeScarabs.Value,
+            TradableCategory.Fossils => Settings.IncludeFossils.Value,
+            TradableCategory.Essences => Settings.IncludeEssences.Value,
+            _ => Settings.IncludeOtherTradables.Value
+        };
+    }
+
+    private string GetTradableCategorySignature()
+    {
+        return string.Concat(Enum.GetValues<TradableCategory>()
+            .Select(category => IsTradableCategoryIncluded(category) ? '1' : '0'));
+    }
+
+    // Disabled categories behave exactly like ForceSkip entries, so every
+    // downstream consumer (scan plan eligibility, market discovery export,
+    // conversion graph, refresh plan) inherits the filter unchanged. Manual
+    // ForceInclude entries and the Chaos/Divine pivots always survive.
+    private CurrencyDiscoveryOverrides ApplyCategoryFilters(
+        CurrencyDiscoveryOverrides manual)
+    {
+        var skipped = new HashSet<string>(
+            manual.ForceSkipMetadata,
+            StringComparer.Ordinal);
+        foreach (var currency in _catalogue!.Items)
+        {
+            if (IsTradableCategoryIncluded(_tradableCategories.Resolve(currency)) ||
+                manual.ForceIncludeMetadata.Contains(currency.Metadata) ||
+                IsProtectedPivotCurrency(currency))
+            {
+                continue;
+            }
+
+            skipped.Add(currency.Metadata);
+        }
+
+        return new CurrencyDiscoveryOverrides(manual.ForceIncludeMetadata, skipped);
+    }
+
+    private static bool IsProtectedPivotCurrency(CurrencyIdentity currency)
+    {
+        return string.Equals(
+                currency.Name,
+                "Chaos Orb",
+                StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(
+                currency.Name,
+                "Divine Orb",
+                StringComparison.OrdinalIgnoreCase);
     }
 
     private bool TryPersistDiscoveryProbe(PendingDiscoveryProbe pendingProbe)
