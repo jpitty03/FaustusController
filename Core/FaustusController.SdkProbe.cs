@@ -1,5 +1,6 @@
 using System.Text;
 using ExileCore.PoEMemory;
+using ExileCore.Shared.Enums;
 
 namespace FaustusController;
 
@@ -50,6 +51,70 @@ public sealed partial class FaustusController
         var panel = GameController.Game.IngameState.IngameUi.CurrencyExchangePanel;
 
         Section("Panel", () => report.AppendLine("   " + Describe("panel", panel)));
+
+        // Order collection (ctrl-click a completed order into stash) needs the
+        // exchange, stash, and inventory all open. Dump all three so the F11
+        // collector's window gate can be built from confirmed reads.
+        Section("Windows", () =>
+        {
+            var ingameUi = GameController.Game.IngameState.IngameUi;
+            report.AppendLine("   " + Describe("CurrencyExchangePanel", panel));
+            report.AppendLine("   " + Describe("StashElement", ingameUi.StashElement));
+            report.AppendLine("   " + Describe("InventoryPanel", ingameUi.InventoryPanel));
+        });
+
+        // Phase 2 of collection (inventory -> stash via ctrl+shift+right-click) must
+        // only click stacks that are NOT covered by the exchange window's right edge.
+        // Dump every visible inventory item's screen rect + grid pos + metadata and
+        // flag covered ones, so the collector's covered-cell logic is built from facts.
+        Section("Inventory grid", () =>
+        {
+            var ingameUi = GameController.Game.IngameState.IngameUi;
+            var inventoryPanel = ingameUi.InventoryPanel;
+            report.AppendLine("   " + Describe("InventoryPanel", inventoryPanel));
+            var inventory = inventoryPanel?[InventoryIndex.PlayerInventory];
+            if (inventory == null)
+            {
+                report.AppendLine("   Inventory: null");
+                return;
+            }
+
+            var server = inventory.ServerInventory;
+            report.AppendLine($"   ServerInventory: Columns={server?.Columns} Rows={server?.Rows}");
+            var exchangeRight = panel.GetClientRectCache.Right;
+            report.AppendLine(
+                $"   Exchange right edge X={exchangeRight:F0} " +
+                "(inventory cells with Left < this are COVERED by the exchange window)");
+            var items = inventory.VisibleInventoryItems;
+            report.AppendLine(
+                $"   VisibleInventoryItems: {(items == null ? "null" : items.Count.ToString())}");
+            var itemCount = items?.Count ?? 0;
+            var coveredCount = 0;
+            for (var i = 0; i < itemCount && i < 60; i++)
+            {
+                var item = items![i];
+                if (item == null)
+                {
+                    report.AppendLine($"      <{i}> null");
+                    continue;
+                }
+
+                var rectangle = item.GetClientRectCache;
+                var covered = rectangle.Left < exchangeRight;
+                if (covered)
+                {
+                    coveredCount++;
+                }
+
+                report.AppendLine(
+                    $"      <{i}> rect=({rectangle.X:F0},{rectangle.Y:F0} " +
+                    $"{rectangle.Width:F0}x{rectangle.Height:F0}) " +
+                    $"{(covered ? "COVERED" : "visible")} '{item.Item?.Path ?? ""}'");
+            }
+
+            report.AppendLine(
+                $"   => {coveredCount} of {itemCount} visible items are covered by the exchange window.");
+        });
 
         Section("Selected pair", () =>
         {
@@ -144,12 +209,96 @@ public sealed partial class FaustusController
             }
         });
 
+        var orderCount = -1;
+        var orderElementCount = -1;
         Section("Orders", () =>
         {
-            report.AppendLine($"   Orders: {(panel.Orders == null ? "null" : panel.Orders.Count.ToString())}");
+            var orders = panel.Orders;
+            var orderElements = panel.OrderElements;
+            orderCount = orders?.Count ?? -1;
+            orderElementCount = orderElements?.Count ?? -1;
+            report.AppendLine($"   Orders: {(orders == null ? "null" : orders.Count.ToString())}");
             report.AppendLine(
-                $"   OrderElements: {(panel.OrderElements == null ? "null" : panel.OrderElements.Count.ToString())}");
+                $"   OrderElements: {(orderElements == null ? "null" : orderElements.Count.ToString())} " +
+                "(equal count => parallel to Orders)");
             report.AppendLine("   " + Describe("RatioElement", panel.RatioElement));
+
+            // Recursively dumps an order element's sub-tree (rects/text/texture) so
+            // Part B can pick the exact bought-currency icon to ctrl-click.
+            void DumpChild(Element? child, int index, string indent, int depth)
+            {
+                if (child == null)
+                {
+                    report.AppendLine($"{indent}<{index}> null");
+                    return;
+                }
+
+                var rectangle = child.GetClientRectCache;
+                report.AppendLine(
+                    $"{indent}<{index}> rect=({rectangle.X:F0},{rectangle.Y:F0} " +
+                    $"{rectangle.Width:F0}x{rectangle.Height:F0}) vis={child.IsVisible} " +
+                    $"childCount={child.ChildCount} text='{child.TextNoTags}' " +
+                    $"texture='{child.TextureName}'");
+                if (depth <= 0)
+                {
+                    return;
+                }
+
+                var kids = child.Children;
+                if (kids == null)
+                {
+                    return;
+                }
+
+                for (var k = 0; k < kids.Count && k < 8; k++)
+                {
+                    DumpChild(kids[k], k, indent + "   ", depth - 1);
+                }
+            }
+
+            var count = orders?.Count ?? 0;
+            for (var i = 0; i < count && i < 12; i++)
+            {
+                var order = orders![i];
+                if (order == null)
+                {
+                    report.AppendLine($"   [{i}] order=null");
+                    continue;
+                }
+
+                var status = order.IsCanceled
+                    ? "Canceled"
+                    : order.IsCompleted
+                        ? "Completed"
+                        : "Pending";
+                report.AppendLine(
+                    $"   [{i}] id={order.PlayerOrderId} {status} " +
+                    $"'{order.OfferedItemType?.BaseName ?? "?"}' -> " +
+                    $"'{order.WantedItemType?.BaseName ?? "?"}' " +
+                    $"wantedStack={order.WantedItemStackSize} " +
+                    $"offered={order.OfferedItemStackSize}/{order.OriginalOfferedItemStackSize}");
+
+                if (orderElements == null || i >= orderElements.Count)
+                {
+                    report.AppendLine("        element: <no parallel OrderElements entry>");
+                    continue;
+                }
+
+                var element = orderElements[i];
+                report.AppendLine("        " + Describe("element", element));
+                var children = element?.Children;
+                if (children == null)
+                {
+                    report.AppendLine("        children: null");
+                    continue;
+                }
+
+                report.AppendLine($"        children: {children.Count}");
+                for (var c = 0; c < children.Count && c < 12; c++)
+                {
+                    DumpChild(children[c], c, "        ", 1);
+                }
+            }
         });
 
         var path = Path.Combine(ConfigDirectory, "FaustusController_sdk-probe.txt");
@@ -157,7 +306,8 @@ public sealed partial class FaustusController
         {
             File.WriteAllText(path, report.ToString());
             _sdkProbeStatus = $"SDK probe: picker options={optionCount} " +
-                $"(catalogue matches={resolvableCount})" +
+                $"(catalogue matches={resolvableCount}); orders={orderCount} " +
+                $"orderElements={orderElementCount}" +
                 (issues.Count > 0 ? $"; ISSUES: {string.Join("; ", issues)}" : "; no read exceptions") +
                 $"; wrote {path}";
         }

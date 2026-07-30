@@ -18,6 +18,7 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
     private readonly OrderStagingController _orderStagingController = new();
     private readonly OrderPlacementController _orderPlacementController = new();
     private readonly SingleHopExecutionController _singleHopExecutionController = new();
+    private readonly OrderCollectionController _orderCollectionController = new();
     private readonly PickerButtonCalibrationController _pickerButtonCalibration = new();
     private readonly PickerButtonCalibrationStore _pickerButtonCalibrationStore = new();
     private readonly CalibratedPickerOpenController _pickerOpenController = new();
@@ -217,6 +218,7 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
         _orderPlacementController.Cancel("Order placement cancelled after area change.");
         _singleHopExecutionController.Cancel(
             "Single-hop execution cancelled after area change.");
+        _orderCollectionController.Cancel("Order collection cancelled after area change.");
         _marketDiscoveryDirty = true;
         _nextMarketDiscoveryRetryUtc = DateTimeOffset.UtcNow;
         _conversionGraphDirty = true;
@@ -308,6 +310,11 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
         if (Settings.ExecuteHopKey.PressedOnce())
         {
             StartSingleHopExecution();
+        }
+
+        if (Settings.CollectOrdersKey.PressedOnce())
+        {
+            StartOrderCollection();
         }
 
         if (_orderStagingController.IsRunning && !AreOrderStagingPermissionsEnabled())
@@ -521,6 +528,7 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
         // Ticked after placement so a Completed order and its outcome are visible
         // this frame; drains the finished execution's audit for persistence.
         TickSingleHopExecution();
+        TickOrderCollection();
 
         var pendingProbe = _liquidityDiscoveryController.PendingProbe;
         if (pendingProbe != null && TryPersistDiscoveryProbe(pendingProbe))

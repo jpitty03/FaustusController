@@ -101,4 +101,13 @@ public sealed class FaustusControllerSettings : ISettings
     {
         IgnoreFocusedInput = true
     };
+    // Verified order collection: ctrl-right-click completed exchange orders into
+    // inventory, then ctrl+shift+right-click each collected currency into stash.
+    // Needs the exchange, stash, and inventory all open; only clicks inventory
+    // stacks not covered by the exchange window (block the covered left columns).
+    public ToggleNode AllowOrderCollection { get; set; } = new(false);
+    public HotkeyNodeV2 CollectOrdersKey { get; set; } = new(Keys.F11)
+    {
+        IgnoreFocusedInput = true
+    };
 }
