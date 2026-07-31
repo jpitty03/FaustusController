@@ -58,22 +58,30 @@ public sealed partial class FaustusController
             return;
         }
 
-        // A standalone hop's floor is its own planned rate less the allowed slippage:
-        // don't trade worse than the analysis assumed (a better live rate still
-        // recomputes up and proceeds).
-        var plannedRate = (double)context.Received / context.Spent *
-            (1.0 - Settings.MaxRateSlippagePercent.Value / 100.0);
+        // A resting (maker) hop needs the extra competing-order permission before any input.
+        if (context.IsResting && !Settings.AllowCompetingOrderExecution)
+        {
+            _hopExecutionStatus =
+                "Single-hop execution blocked: the selected first hop is a RESTING LIMIT order; " +
+                "enable Allow Competing Order Execution to execute it.";
+            return;
+        }
+
+        // The hop is gated on the exact staged amounts clearing its own planned rate less the
+        // allowed integer slippage (a better live rate still recomputes up and proceeds).
         if (!_singleHopExecutionController.Start(
             GameController,
             _orderStagingController,
             context.Step,
             context.OfferedCurrency,
             context.WantedCurrency,
+            context.Mode,
+            context.BookSide,
             context.Spent,
             context.Received,
             context.GiveUnitsPerLot,
             context.GetUnitsPerLot,
-            plannedRate,
+            Settings.MaxRateSlippagePercent.Value,
             out var startFailure))
         {
             _hopExecutionStatus = startFailure;

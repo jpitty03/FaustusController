@@ -14,26 +14,29 @@ public enum SingleHopExecutionState
 /// <summary>
 /// Verified single-hop execution (F10). Orchestrates the two existing verified
 /// controllers rather than re-ticking them: it drives <see cref="OrderStagingController"/>
-/// to stage the planned hop, gates placement on an explicit pre-execution rate check
-/// (the live staged rate must be no worse than the planned rate), then hands off to
+/// to stage the planned hop (immediate or resting), gates placement on an explicit
+/// pre-execution rate check (the actual staged amounts must clear the hop's planned rate
+/// less the allowed slippage, by exact overflow-safe arithmetic), then hands off to
 /// <see cref="OrderPlacementController"/> and, once an order is confirmed, produces a
-/// post-execution audit comparing actual received units against the plan. The host
-/// keeps ticking staging and placement each frame; this coordinator only observes
-/// their state and manages the handoff, exactly as placement already observes staging.
-/// Any mismatch cancels with a reason instead of retrying, and it never clicks when the
-/// rate gate fails.
+/// placement audit. For a resting order F10's contract ends at verified placement: it
+/// records whether the order is still outstanding (Pending) or already completed, and never
+/// waits, collects, or cancels. Any mismatch cancels with a reason instead of retrying, and
+/// it never clicks when the rate gate fails.
 /// </summary>
 public sealed class SingleHopExecutionController
 {
     private CurrencyCapture _offeredCurrency = new();
     private CurrencyCapture _wantedCurrency = new();
+    private ExecutionMode _mode;
+    private string _bookSide = "";
     private long _plannedSpent;
     private long _plannedReceived;
     private int _plannedGiveUnits;
     private int _plannedGetUnits;
-    private double _minWantedPerOffered;
-    private long _recomputedSpent;
-    private long _recomputedReceived;
+    private int _slippagePercent;
+    private long _stagedSpent;
+    private long _stagedReceived;
+    private long _uncommittedRemainder;
     private int _executedGiveUnits;
     private int _executedGetUnits;
     private bool _ratePreCheckPassed;
@@ -52,11 +55,13 @@ public sealed class SingleHopExecutionController
         CurrencyScanPlanStep step,
         CurrencyCapture offeredCurrency,
         CurrencyCapture wantedCurrency,
+        ExecutionMode mode,
+        string bookSide,
         long plannedSpent,
         long plannedReceived,
         int plannedGiveUnitsPerLot,
         int plannedGetUnitsPerLot,
-        double minWantedPerOffered,
+        int slippagePercent,
         out string failureReason)
     {
         if (IsRunning)
@@ -65,7 +70,8 @@ public sealed class SingleHopExecutionController
         }
 
         if (plannedSpent <= 0 || plannedReceived <= 0 ||
-            plannedGiveUnitsPerLot <= 0 || plannedGetUnitsPerLot <= 0)
+            plannedGiveUnitsPerLot <= 0 || plannedGetUnitsPerLot <= 0 ||
+            slippagePercent is < 0 or > 100)
         {
             return Fail(
                 "Single-hop execution blocked: the selected hop has non-positive economics.",
@@ -75,6 +81,7 @@ public sealed class SingleHopExecutionController
         if (!stagingController.Start(
             gameController,
             step,
+            mode,
             plannedSpent,
             plannedReceived,
             out var stagingFailure))
@@ -86,20 +93,23 @@ public sealed class SingleHopExecutionController
 
         _offeredCurrency = offeredCurrency;
         _wantedCurrency = wantedCurrency;
+        _mode = mode;
+        _bookSide = bookSide;
         _plannedSpent = plannedSpent;
         _plannedReceived = plannedReceived;
         _plannedGiveUnits = plannedGiveUnitsPerLot;
         _plannedGetUnits = plannedGetUnitsPerLot;
-        _minWantedPerOffered = minWantedPerOffered;
-        _recomputedSpent = plannedSpent;
-        _recomputedReceived = plannedReceived;
+        _slippagePercent = slippagePercent;
+        _stagedSpent = plannedSpent;
+        _stagedReceived = plannedReceived;
+        _uncommittedRemainder = 0;
         _executedGiveUnits = 0;
         _executedGetUnits = 0;
         _ratePreCheckPassed = false;
         _league = gameController.Game.IngameState.ServerData.League;
         _pendingAudit = null;
         State = SingleHopExecutionState.Staging;
-        Status = $"Executing hop: staging {_plannedSpent} {_offeredCurrency.Name} -> " +
+        Status = $"Executing {ModeLabel} hop: staging {_plannedSpent} {_offeredCurrency.Name} -> " +
             $"{_plannedReceived} {_wantedCurrency.Name}.";
         failureReason = string.Empty;
         return true;
@@ -138,6 +148,8 @@ public sealed class SingleHopExecutionController
         Status = reason;
     }
 
+    private string ModeLabel => _mode == ExecutionMode.RestingLimit ? "resting-limit" : "immediate";
+
     private void TickStaging(
         GameController gameController,
         OrderStagingController stagingController,
@@ -156,32 +168,38 @@ public sealed class SingleHopExecutionController
             return;
         }
 
-        // Staging has recomputed the amounts to the live rate; the profitability gate
-        // decides whether to place. The live staged rate must give at least the caller's
-        // floor of wanted units per offered unit (F10: the hop's planned rate; F5: the
-        // rate that keeps the whole loop net-positive) — otherwise never click.
-        var live = stagingController.StagedImmediateRate;
+        // Staging sized the actual amounts to the live rate; the profitability gate now decides
+        // whether to place. Gate the REAL staged amounts (not just the book head) against the
+        // hop's planned rate less the allowed slippage, so floor rounding can never place a
+        // ratio below the advertised floor.
+        var live = stagingController.StagedRate;
         if (live == null)
         {
             stagingController.Cancel(
-                "Single-hop execution aborted: the staged pair has no live immediate rate.");
-            Cancel("Single-hop execution aborted: no live immediate rate to verify against the floor.");
+                "Single-hop execution aborted: the staged pair has no live rate.");
+            Cancel("Single-hop execution aborted: no live rate to verify against the floor.");
             return;
         }
 
         _executedGiveUnits = live.GiveUnits;
         _executedGetUnits = live.GetUnits;
-        _recomputedSpent = stagingController.OfferedAmount;
-        _recomputedReceived = stagingController.WantedAmount;
-        _ratePreCheckPassed = live.GetUnits >= _minWantedPerOffered * live.GiveUnits;
+        _stagedSpent = stagingController.OfferedAmount;
+        _stagedReceived = stagingController.WantedAmount;
+        _uncommittedRemainder = stagingController.UncommittedRemainder;
+        _ratePreCheckPassed = OrderExecutionMath.PassesSlippageFloor(
+            _stagedSpent,
+            _stagedReceived,
+            _plannedGetUnits,
+            _plannedGiveUnits,
+            _slippagePercent);
         if (!_ratePreCheckPassed)
         {
             stagingController.Cancel(
-                "Single-hop execution aborted: the live rate is below the profitability floor.");
+                "Single-hop execution aborted: the staged ratio is below the profitability floor.");
             Cancel(
-                $"Single-hop execution aborted: live rate {live.GetUnits}:{live.GiveUnits} " +
-                $"({(double)live.GetUnits / live.GiveUnits:F4} wanted/offered) is below the floor " +
-                $"{_minWantedPerOffered:F4}; no order placed.");
+                $"Single-hop execution aborted: staged {_stagedReceived}:{_stagedSpent} is below the " +
+                $"planned {_plannedGetUnits}:{_plannedGiveUnits} floor (slippage {_slippagePercent}%); " +
+                "no order placed.");
             return;
         }
 
@@ -193,8 +211,8 @@ public sealed class SingleHopExecutionController
         }
 
         State = SingleHopExecutionState.Placing;
-        Status = $"Rate verified ({live.GetUnits}:{live.GiveUnits} >= planned " +
-            $"{_plannedGetUnits}:{_plannedGiveUnits}); placing the order.";
+        Status = $"Rate verified (staged {_stagedReceived}:{_stagedSpent} clears planned " +
+            $"{_plannedGetUnits}:{_plannedGiveUnits}); placing the {ModeLabel} order.";
     }
 
     private void TickPlacing(OrderPlacementController placementController)
@@ -220,13 +238,21 @@ public sealed class SingleHopExecutionController
 
         _pendingAudit = BuildAudit(outcome);
         State = SingleHopExecutionState.Completed;
-        Status = $"Executed {_recomputedSpent} {_offeredCurrency.Name} -> " +
-            $"{_pendingAudit.ActualReceived} {_wantedCurrency.Name} " +
-            $"(planned {_plannedReceived}, recomputed {_recomputedReceived}; " +
-            (_pendingAudit.FullyFilled
-                ? "fully filled"
-                : $"shortfall {_pendingAudit.ReceivedShortfall}") +
-            $"); order {outcome.PlayerOrderId} {outcome.Status}.";
+        if (_pendingAudit.OutstandingAtAudit)
+        {
+            Status = $"Placed and OUTSTANDING ({ModeLabel}): {_stagedSpent} {_offeredCurrency.Name} -> " +
+                $"{_stagedReceived} {_wantedCurrency.Name}; order {outcome.PlayerOrderId} is Pending. " +
+                "Manage it manually (collect/cancel).";
+        }
+        else
+        {
+            Status = $"Completed at placement ({ModeLabel}): {_stagedSpent} {_offeredCurrency.Name} -> " +
+                $"{_pendingAudit.ActualReceived} {_wantedCurrency.Name} " +
+                (_pendingAudit.FullyFilled
+                    ? "fully filled"
+                    : $"shortfall {_pendingAudit.ReceivedShortfall}") +
+                $"; order {outcome.PlayerOrderId} {outcome.Status}.";
+        }
     }
 
     private HopExecutionAuditFile BuildAudit(PlacedOrderOutcome outcome)
@@ -237,32 +263,44 @@ public sealed class SingleHopExecutionController
         var actualReceived = outcome.OfferedRatioPart > 0
             ? (long)offeredSpent * outcome.WantedRatioPart / outcome.OfferedRatioPart
             : 0;
-        // Shortfall is measured against what we actually asked for at the live rate
-        // (the recomputed amount), not the stale analysis plan.
-        var shortfall = _recomputedReceived - actualReceived;
+        // A pending (resting or unfilled) order is still outstanding regardless of any
+        // partial fill; only a terminal completed order that satisfies the staged wanted
+        // amount is FullyFilled. Shortfall is measured against the staged (live-recomputed)
+        // wanted amount, not the stale analysis plan.
+        var outstanding = !outcome.IsCompleted && !outcome.IsCanceled;
+        var shortfall = _stagedReceived - actualReceived;
+        var fullyFilled = outcome.IsCompleted && shortfall <= 0;
         return new HopExecutionAuditFile
         {
-            SchemaVersion = 1,
+            SchemaVersion = 2,
             ExecutedAtUtc = DateTimeOffset.UtcNow,
             League = _league,
             OfferedCurrency = _offeredCurrency,
             WantedCurrency = _wantedCurrency,
+            ExecutionMode = ExecutionModes.ToPersisted(_mode),
+            BookSide = _bookSide,
             PlannedGiveUnitsPerLot = _plannedGiveUnits,
             PlannedGetUnitsPerLot = _plannedGetUnits,
             PlannedSpent = _plannedSpent,
             PlannedReceived = _plannedReceived,
-            RecomputedSpent = _recomputedSpent,
-            RecomputedReceived = _recomputedReceived,
+            RecomputedSpent = _stagedSpent,
+            RecomputedReceived = _stagedReceived,
+            UncommittedRemainder = _uncommittedRemainder,
             ExecutedGiveUnits = _executedGiveUnits,
             ExecutedGetUnits = _executedGetUnits,
             RatePreCheckPassed = _ratePreCheckPassed,
             PlayerOrderId = outcome.PlayerOrderId,
             OrderStatus = outcome.Status,
+            PlacedOfferedRatioPart = outcome.OfferedRatioPart,
+            PlacedWantedRatioPart = outcome.WantedRatioPart,
             GoldCost = outcome.GoldCost,
             OfferedSpent = offeredSpent,
             ActualReceived = actualReceived,
             ReceivedShortfall = shortfall,
-            FullyFilled = shortfall <= 0
+            PlacementVerified = true,
+            CompletedAtPlacement = outcome.IsCompleted,
+            OutstandingAtAudit = outstanding,
+            FullyFilled = fullyFilled
         };
     }
 

@@ -110,6 +110,10 @@ public sealed partial class FaustusController
             constraints.Add("gold costs");
         }
 
+        constraints.Add(result.AllowsRestingOrders
+            ? "resting orders ON"
+            : $"immediate-only ({result.ExcludedRestingEdgeCount} resting edges excluded)");
+
         return constraints.Count > 0
             ? $" [{string.Join(", ", constraints)}]"
             : "";
@@ -138,8 +142,14 @@ public sealed partial class FaustusController
             ? $"+{route.NetGainUnits} net {route.TargetCurrency.Name} " +
                 $"({route.ReturnedStartUnits} returned)"
             : $"{route.TargetUnits} {route.TargetCurrency.Name}";
+        var restingHops = route.Hops.Count(
+            hop => hop.ExecutionMode == ExecutionModes.RestingLimit);
+        var modeNote = restingHops > 0
+            ? $" [{restingHops} RESTING hop(s)]"
+            : "";
         _routeAnalysisStatus = $"Route {route.Rank}/{count}: {yield} in {route.HopCount} hops " +
-            $"(gold {route.TotalGoldCost}, stranded {route.StrandedRemainderCurrencyCount}).";
+            $"(gold {route.TotalGoldCost}, stranded {route.StrandedRemainderCurrencyCount})" +
+            $"{modeNote}.";
     }
 
     private string GetCurrentLeague()

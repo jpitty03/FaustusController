@@ -23,6 +23,18 @@ public enum SinglePairScanFailureKind
     Automation
 }
 
+/// <summary>
+/// Which live quote a stable-rate capture must observe before it will complete.
+/// Discovery callers use <see cref="EitherBook"/> (any evidence of a market); order
+/// staging narrows to the book its execution mode will actually trade against.
+/// </summary>
+public enum StableRateRequirement
+{
+    EitherBook,
+    ImmediateBook,
+    CompetingBook
+}
+
 public sealed class SinglePairScanController
 {
     private static readonly TimeSpan OperationTimeout = TimeSpan.FromSeconds(30);
@@ -62,6 +74,9 @@ public sealed class SinglePairScanController
     // Owned by FaustusController.Tick from Settings.StableRateSampleCount;
     // clamped defensively so a bad value can never stall a capture forever.
     public int StableRateSampleTarget { get; set; } = 3;
+    // Which book a stable capture must observe. Set by the caller before Start and reset to
+    // EitherBook on the next Start so a narrowed staging requirement never leaks to discovery.
+    public StableRateRequirement RateRequirement { get; set; } = StableRateRequirement.EitherBook;
 
     public bool Start(
         GameController gameController,
@@ -97,6 +112,9 @@ public sealed class SinglePairScanController
         _quotedQueryRetryAttempted = false;
         _allowOpenPickerReuse = allowOpenPickerReuse;
         _allowQuotedQueryFallback = allowQuotedQueryFallback;
+        // Default to either-book evidence; a caller that needs a specific book (order staging)
+        // sets RateRequirement after Start returns, before the scan reaches stable-rate polling.
+        RateRequirement = StableRateRequirement.EitherBook;
         FailureKind = SinglePairScanFailureKind.None;
         _operationDeadlineUtc = DateTimeOffset.UtcNow + OperationTimeout;
         State = SinglePairScanState.EnsurePair;
@@ -481,9 +499,19 @@ public sealed class SinglePairScanController
             return;
         }
 
+        // The observed rate depends on which book this scan must stabilize:
+        //   ImmediateBook -> the top immediate rate (what an immediate order takes)
+        //   CompetingBook -> the top competing rate in selected orientation (what a resting
+        //                    order queues at); NOT the raw rate used for either-book stability
+        //   EitherBook    -> immediate if present, else the competing raw rate (discovery)
         var immediateRate = snapshot.TopImmediateStock?.SelectedPairRate;
-        var competingRate = snapshot.TopCompetingStock?.RawRate;
-        var observedRate = immediateRate ?? competingRate;
+        var observedRate = RateRequirement switch
+        {
+            StableRateRequirement.ImmediateBook => immediateRate,
+            StableRateRequirement.CompetingBook =>
+                snapshot.TopCompetingStock?.SelectedPairRate,
+            _ => immediateRate ?? snapshot.TopCompetingStock?.RawRate
+        };
         if (observedRate == null)
         {
             _readableNoMarketSamples = _lastReadableNoMarketAtUtc != default &&
@@ -491,18 +519,24 @@ public sealed class SinglePairScanController
                     ? _readableNoMarketSamples + 1
                     : 1;
             _lastReadableNoMarketAtUtc = now;
+            var bookLabel = RateRequirement switch
+            {
+                StableRateRequirement.ImmediateBook => "immediate",
+                StableRateRequirement.CompetingBook => "competing",
+                _ => "immediate or competing"
+            };
             if (_readableNoMarketSamples >= 3 &&
                 now - _lastPositiveRateAtUtc >= MinimumNoMarketDecisionDelay &&
                 now - _lastRateReadFailureAtUtc >= MinimumNoMarketDecisionDelay &&
                 now - _rateWaitStartedUtc >= MinimumNoMarketDecisionDelay)
             {
                 Cancel(
-                    "No immediate or competing market rate was observed in three consecutive readable samples.",
+                    $"No {bookLabel} market rate was observed in three consecutive readable samples.",
                     SinglePairScanFailureKind.NoMarketRate);
                 return;
             }
 
-            Status = $"No immediate or competing market rate: confirming readable sample " +
+            Status = $"No {bookLabel} market rate: confirming readable sample " +
                 $"{_readableNoMarketSamples}/3.";
             return;
         }

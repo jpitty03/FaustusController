@@ -123,4 +123,8 @@ public sealed class FaustusControllerSettings : ISettings
     // planned (a better rate always recomputes up and proceeds); raise it to tolerate
     // small adverse drift. Applies to F10 and every F5 hop.
     public RangeNode<int> MaxRateSlippagePercent { get; set; } = new(0, 0, 100);
+    // Extra permission required to STAGE or PLACE a resting-limit (maker) hop with F6/F8/F10.
+    // Immediate hops never need it. Default off; a maker route cannot move the cursor or type
+    // until this is enabled alongside the usual staging/placement toggles.
+    public ToggleNode AllowCompetingOrderExecution { get; set; } = new(false);
 }

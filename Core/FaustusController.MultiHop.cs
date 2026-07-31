@@ -2,7 +2,8 @@ namespace FaustusController;
 
 public sealed partial class FaustusController
 {
-    private const int MultiHopRunSchemaVersion = 1;
+    // v2: nested hop audits gained execution-mode, placement-semantics, and ratio-part fields.
+    private const int MultiHopRunSchemaVersion = 2;
 
     private string _multiHopStatus =
         "Press F5 to execute the whole selected route (enable Allow Multi-Hop Execution; " +
@@ -79,6 +80,18 @@ public sealed partial class FaustusController
                 return;
             }
 
+            // F5 rejects any route containing a resting hop before any input begins: the chain
+            // has no fill/cancel lifecycle for resting orders. Place resting hops one at a time
+            // with F10 instead.
+            if (context.IsResting)
+            {
+                _multiHopStatus =
+                    $"Multi-hop blocked: hop {i + 1} ({context.OfferedCurrency.Name} -> " +
+                    $"{context.WantedCurrency.Name}) is a RESTING LIMIT order; F5 executes " +
+                    "immediate-only routes. Use F10 for a single resting hop.";
+                return;
+            }
+
             contexts.Add(context);
         }
 
@@ -98,7 +111,7 @@ public sealed partial class FaustusController
             contexts,
             contexts[0].Spent,
             analysis.Request.GoldBudget,
-            Settings.MaxRateSlippagePercent.Value / 100.0,
+            Settings.MaxRateSlippagePercent.Value,
             out var startFailure))
         {
             _multiHopStatus = startFailure;

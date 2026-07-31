@@ -16,7 +16,7 @@ public readonly record struct CurrencyConversionGraphResult(
 
 public sealed class CurrencyConversionGraphExporter
 {
-    private const int CurrentSchemaVersion = 1;
+    private const int CurrentSchemaVersion = 2;
 
     public CurrencyConversionGraphResult Export(
         CurrencyCatalogue catalogue,
@@ -167,14 +167,17 @@ public sealed class CurrencyConversionGraphExporter
     private static List<CurrencyConversionGraphEdgeCapture> SelectLatestEdges(
         IReadOnlyCollection<CurrencyConversionGraphEdgeCapture> edges)
     {
+        // Identity is directed pair PLUS execution mode: a single directed pair can carry
+        // both an Immediate and a RestingLimit edge, and each must survive independently.
         return edges
-            .GroupBy(edge => new CurrencyPairKey(edge.OfferedMetadata, edge.WantedMetadata))
+            .GroupBy(edge => (edge.OfferedMetadata, edge.WantedMetadata, edge.ExecutionMode))
             .Select(group => group
                 .OrderByDescending(edge => edge.CapturedAtUtc)
                 .ThenByDescending(edge => edge.CaptureId)
                 .First())
             .OrderBy(edge => edge.OfferedMetadata, StringComparer.Ordinal)
             .ThenBy(edge => edge.WantedMetadata, StringComparer.Ordinal)
+            .ThenBy(edge => edge.ExecutionMode, StringComparer.Ordinal)
             .ToList();
     }
 
@@ -272,34 +275,87 @@ public sealed class CurrencyConversionGraphExporter
         return false;
     }
 
+    // Projects up to four edges from one coherent selected-pair snapshot. Both directions
+    // are covered in both execution modes when the source quotes exist:
+    //   selected direction  immediate  <- TopImmediateStock.SelectedPairRate   (ImmediateBook)
+    //   reverse direction    immediate  <- TopCompetingStock.RawRate            (CompetingBook)
+    //   selected direction  resting    <- TopCompetingStock.SelectedPairRate   (CompetingBook)
+    //   reverse direction    resting    <- reciprocal of the immediate SelectedPairRate (ImmediateBook)
+    // Only Immediate edges carry fillable liquidity; resting edges assume none because the
+    // competing listed volume is queue competition, not guaranteed fill depth.
     private static IEnumerable<CurrencyConversionGraphEdgeCapture> CreateEdges(
         ExchangePairSnapshot snapshot,
         string coherence,
         DateTimeOffset generatedAtUtc)
     {
-        if ((snapshot.TopImmediateStock?.SelectedPairRate ?? snapshot.MarketRate) is { } immediateRate)
+        var offered = snapshot.OfferedCurrency.Metadata;
+        var wanted = snapshot.WantedCurrency.Metadata;
+        var immediateSelected = snapshot.TopImmediateStock?.SelectedPairRate ?? snapshot.MarketRate;
+
+        if (immediateSelected is { } selectedImmediateRate)
         {
             yield return CreateEdge(
                 snapshot,
-                snapshot.OfferedCurrency.Metadata,
-                snapshot.WantedCurrency.Metadata,
-                immediateRate,
+                offered,
+                wanted,
+                selectedImmediateRate,
                 snapshot.TopImmediateStock?.ListedCount ?? 0,
+                hasImmediateLiquidity: true,
                 coherence,
                 "ImmediateBook",
+                ExecutionModes.Immediate,
+                generatedAtUtc);
+
+            // Reverse resting: posting an order to buy the offered item with the wanted item
+            // at the immediate book's ratio, reciprocated to the reverse direction.
+            if (RationalExchangeRate.TryCreate(
+                    selectedImmediateRate.RawGive,
+                    selectedImmediateRate.RawGet,
+                    out var reverseResting))
+            {
+                yield return CreateEdge(
+                    snapshot,
+                    wanted,
+                    offered,
+                    reverseResting!,
+                    0,
+                    hasImmediateLiquidity: false,
+                    coherence,
+                    "ImmediateBook",
+                    ExecutionModes.RestingLimit,
+                    generatedAtUtc);
+            }
+        }
+
+        if (snapshot.TopCompetingStock?.RawRate is { } competingRawRate)
+        {
+            yield return CreateEdge(
+                snapshot,
+                wanted,
+                offered,
+                competingRawRate,
+                snapshot.TopCompetingStock?.ListedCount ?? 0,
+                hasImmediateLiquidity: true,
+                coherence,
+                "CompetingBook",
+                ExecutionModes.Immediate,
                 generatedAtUtc);
         }
 
-        if (snapshot.TopCompetingStock?.RawRate is { } competingRate)
+        if (snapshot.TopCompetingStock?.SelectedPairRate is { } competingSelectedRate)
         {
+            // Selected resting: posting an order to buy the wanted item with the offered item
+            // at the competing book's ratio (the top competing listing's selected orientation).
             yield return CreateEdge(
                 snapshot,
-                snapshot.WantedCurrency.Metadata,
-                snapshot.OfferedCurrency.Metadata,
-                competingRate,
-                snapshot.TopCompetingStock?.ListedCount ?? 0,
+                offered,
+                wanted,
+                competingSelectedRate,
+                0,
+                hasImmediateLiquidity: false,
                 coherence,
                 "CompetingBook",
+                ExecutionModes.RestingLimit,
                 generatedAtUtc);
         }
     }
@@ -310,8 +366,10 @@ public sealed class CurrencyConversionGraphExporter
         string wantedMetadata,
         RationalExchangeRate rate,
         int listedCount,
+        bool hasImmediateLiquidity,
         string coherence,
         string bookSide,
+        string executionMode,
         DateTimeOffset generatedAtUtc)
     {
         return new CurrencyConversionGraphEdgeCapture
@@ -327,6 +385,8 @@ public sealed class CurrencyConversionGraphExporter
             Source = snapshot.Source.ToString(),
             Coherence = coherence,
             BookSide = bookSide,
+            ExecutionMode = executionMode,
+            HasImmediateLiquidity = hasImmediateLiquidity,
             RawGet = rate.RawGet,
             RawGive = rate.RawGive,
             GetUnits = rate.GetUnits,
@@ -369,13 +429,16 @@ public sealed class CurrencyConversionGraphExporter
             throw new InvalidDataException("Conversion graph vertices are invalid or duplicated.");
         }
 
-        var pairs = new HashSet<CurrencyPairKey>();
+        // Identity is directed pair plus execution mode; the same directed pair may appear
+        // once per mode, so a duplicate (pair, mode) is the invalid case.
+        var pairModes = new HashSet<(string, string, string)>();
         foreach (var edge in file.Edges)
         {
-            var pair = new CurrencyPairKey(edge.OfferedMetadata, edge.WantedMetadata);
             if (!vertices.ContainsKey(edge.OfferedMetadata) ||
                 !vertices.ContainsKey(edge.WantedMetadata) ||
-                edge.OfferedMetadata == edge.WantedMetadata || !pairs.Add(pair) ||
+                edge.OfferedMetadata == edge.WantedMetadata ||
+                !ExecutionModes.IsValid(edge.ExecutionMode) ||
+                !pairModes.Add((edge.OfferedMetadata, edge.WantedMetadata, edge.ExecutionMode)) ||
                 edge.CaptureId == Guid.Empty ||
                 edge.CapturedAtUtc == default || edge.AgeSecondsAtGeneration < 0 ||
                 edge.CollectorSessionId == Guid.Empty || !edge.ScanId.HasValue ||
@@ -387,6 +450,8 @@ public sealed class CurrencyConversionGraphExporter
                 rate.WantedPerOffered != edge.WantedPerOffered ||
                 edge.ListedCount < 0 ||
                 edge.BookSide is not "ImmediateBook" and not "CompetingBook" ||
+                // Immediate edges carry fillable depth; resting edges must not claim any.
+                (edge.ExecutionMode == ExecutionModes.RestingLimit && edge.HasImmediateLiquidity) ||
                 edge.Coherence is not "ActiveDiscoveryProbe" and not "CompletedBoundedScan")
             {
                 throw new InvalidDataException("Conversion graph contains an invalid edge.");
@@ -426,7 +491,15 @@ public sealed class CurrencyConversionGraphEdgeCapture
     public int? ScanSequence { get; set; }
     public string Source { get; set; } = "";
     public string Coherence { get; set; } = "";
+    // Provenance: which book the quote was read from (ImmediateBook = the wanted-item
+    // listings you can take now; CompetingBook = the offered-item listings you queue behind).
     public string BookSide { get; set; } = "";
+    // Intent: Immediate (take a listing now) or RestingLimit (post a resting order at the
+    // competing ratio). Distinct from BookSide — see ExecutionModes.
+    public string ExecutionMode { get; set; } = ExecutionModes.Immediate;
+    // True only for Immediate edges: ListedCount is fillable depth. RestingLimit edges set
+    // this false — the competing listed volume is queue competition, not guaranteed fill depth.
+    public bool HasImmediateLiquidity { get; set; }
     public int RawGet { get; set; }
     public int RawGive { get; set; }
     public int GetUnits { get; set; }

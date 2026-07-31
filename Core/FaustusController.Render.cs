@@ -54,10 +54,17 @@ public sealed partial class FaustusController
                     ? SharpDX.Color.Yellow
                     : SharpDX.Color.Red;
 
+            var modeLabel = hop.ExecutionMode == ExecutionModes.RestingLimit
+                ? "RESTING LIMIT"
+                : "immediate";
+            var modeColor = hop.ExecutionMode == ExecutionModes.RestingLimit
+                ? SharpDX.Color.Orange
+                : SharpDX.Color.White;
             Graphics.DrawText(
-                $"  Hop {hop.Sequence}: {hop.OfferedCurrency.Name} -> {hop.WantedCurrency.Name}  [{freshnessLabel}]",
+                $"  Hop {hop.Sequence} [{modeLabel}]: {hop.OfferedCurrency.Name} -> " +
+                $"{hop.WantedCurrency.Name}  [{freshnessLabel}]",
                 new Vector2(x, y),
-                SharpDX.Color.White);
+                modeColor);
             y += 20;
 
             Graphics.DrawText(
@@ -72,7 +79,8 @@ public sealed partial class FaustusController
                 ? $"fillable: {hop.FillableLots} | capped: {hop.LotsCappedByLiquidity.ToString().ToLowerInvariant()}"
                 : "liquidity: disabled";
             Graphics.DrawText(
-                $"    {hop.BookSide} | {hop.Coherence} | gold: {hop.GoldCost} | {liquidityLabel}",
+                $"    {hop.ExecutionMode} | {hop.BookSide} | {hop.Coherence} | " +
+                $"gold: {hop.GoldCost} | {liquidityLabel}",
                 new Vector2(x, y),
                 freshnessColor);
             y += 20;

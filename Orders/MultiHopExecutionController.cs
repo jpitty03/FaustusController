@@ -29,7 +29,7 @@ public sealed class MultiHopExecutionController
 
     private IReadOnlyList<HopExecutionContext> _hops = [];
     private long _goldBudget;
-    private double _rateSlippageFraction;
+    private int _slippagePercent;
     private long _startAmount;
     private int _index;
     private bool _executorStarted;
@@ -56,7 +56,7 @@ public sealed class MultiHopExecutionController
         IReadOnlyList<HopExecutionContext> hops,
         long startAmount,
         long goldBudget,
-        double rateSlippageFraction,
+        int slippagePercent,
         out string failureReason)
     {
         if (IsRunning)
@@ -70,6 +70,19 @@ public sealed class MultiHopExecutionController
             return Fail("Multi-hop execution blocked: the route has no hops.", out failureReason);
         }
 
+        // Resting hops need fill/cancel lifecycle handling the chain does not implement; reject
+        // the whole route before hop 1 rather than place an order the chain cannot wait on.
+        for (var i = 0; i < hops.Count; i++)
+        {
+            if (hops[i].IsResting)
+            {
+                return Fail(
+                    $"Multi-hop execution blocked: hop {i + 1} is a RESTING LIMIT order; the chain " +
+                    "cannot wait on or cancel resting orders. Use F10 to place a single resting hop.",
+                    out failureReason);
+            }
+        }
+
         if (!gameController.Window.IsForeground())
         {
             return Fail(
@@ -79,7 +92,7 @@ public sealed class MultiHopExecutionController
 
         _hops = hops;
         _goldBudget = goldBudget;
-        _rateSlippageFraction = rateSlippageFraction;
+        _slippagePercent = slippagePercent;
         _startAmount = startAmount;
         _index = 0;
         _executorStarted = false;
@@ -149,11 +162,13 @@ public sealed class MultiHopExecutionController
                 context.Step,
                 context.OfferedCurrency,
                 context.WantedCurrency,
+                context.Mode,
+                context.BookSide,
                 context.Spent,
                 context.Received,
                 context.GiveUnitsPerLot,
                 context.GetUnitsPerLot,
-                ComputeHopFloor(),
+                _slippagePercent,
                 out var startFailure))
             {
                 Cancel($"Multi-hop halted at hop {_index + 1}: could not start execution. " +
@@ -295,22 +310,9 @@ public sealed class MultiHopExecutionController
         return _audits.Count > 0 ? _audits[^1].WantedCurrency.Name : "";
     }
 
-    // The minimum wanted-per-offered rate hop _index may execute at: its own
-    // analysis-planned rate, less the allowed slippage. (The route analyzer's amounts
-    // don't telescope — a hop can spend inventory it wasn't handed by the prior hop —
-    // so a whole-loop rate-product floor is invalid; each hop is gated against its own
-    // planned rate, exactly like F10.)
-    private double ComputeHopFloor()
-    {
-        var hop = _hops[_index];
-        if (hop.Spent <= 0)
-        {
-            return 0;
-        }
-
-        var plannedRate = (double)hop.Received / hop.Spent;
-        return plannedRate * (1.0 - _rateSlippageFraction);
-    }
+    // Each hop is gated inside SingleHopExecutionController against its OWN analysis-planned
+    // rate less the allowed integer slippage (the route analyzer's amounts don't telescope, so
+    // a whole-loop rate-product floor is invalid). The chain only passes _slippagePercent through.
 
     private static bool IsOrderCompleted(GameController gameController, int playerOrderId)
     {

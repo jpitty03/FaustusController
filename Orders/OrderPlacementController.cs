@@ -32,6 +32,7 @@ public sealed class OrderPlacementController
     private const float ManualInterruptionDistance = 25f;
 
     private CurrencyScanPlanStep? _step;
+    private ExecutionMode _mode;
     private long _offeredAmount;
     private long _wantedAmount;
     private Vector2 _movementStart;
@@ -190,6 +191,7 @@ public sealed class OrderPlacementController
         }
 
         _step = step;
+        _mode = stagingController.StagedMode;
         _offeredAmount = stagingController.OfferedAmount;
         _wantedAmount = stagingController.WantedAmount;
         if (!TryValidatePlacementContext(
@@ -383,6 +385,15 @@ public sealed class OrderPlacementController
         var placedOrders = panel.Orders;
         if (placedOrders != null)
         {
+            // A verified new order must have a new id, the exact staged pair, the staged
+            // ORIGINAL offered amount, and a ratio equivalent to the staged ratio by cross
+            // multiplication (tolerant of unreduced parts). Count every exact match: a
+            // canceled exact match is a failure, more than one is ambiguous, and a single
+            // pending or completed exact match is the success. The matched order's data is
+            // captured inline so we never hold the SDK element past this frame.
+            var exactMatchCount = 0;
+            var canceledExactMatch = false;
+            PlacedOrderOutcome? matched = null;
             foreach (var order in placedOrders)
             {
                 if (order == null || _baselineOrderIds.Contains(order.PlayerOrderId))
@@ -396,14 +407,26 @@ public sealed class OrderPlacementController
                     continue;
                 }
 
-                var orderStatus = order.IsCanceled
-                    ? "Canceled"
-                    : order.IsCompleted
-                        ? "Completed (filled)"
-                        : "Pending";
-                Outcome = new PlacedOrderOutcome(
+                if (order.OriginalOfferedItemStackSize != _offeredAmount ||
+                    !OrderExecutionMath.RatiosEquivalent(
+                        order.OfferedItemRatioPart,
+                        order.WantedItemRatioPart,
+                        _offeredAmount,
+                        _wantedAmount))
+                {
+                    continue;
+                }
+
+                if (order.IsCanceled)
+                {
+                    canceledExactMatch = true;
+                    continue;
+                }
+
+                exactMatchCount++;
+                matched = new PlacedOrderOutcome(
                     order.PlayerOrderId,
-                    orderStatus,
+                    order.IsCompleted ? "Completed (filled)" : "Pending",
                     order.GoldCost,
                     order.OriginalOfferedItemStackSize,
                     order.OfferedItemStackSize,
@@ -412,11 +435,31 @@ public sealed class OrderPlacementController
                     order.WantedItemRatioPart,
                     order.IsCompleted,
                     order.IsCanceled);
+            }
+
+            if (canceledExactMatch)
+            {
+                Cancel("Order placement verification failed: the matching new order is Canceled; " +
+                    "inspect the placed-orders tab before retrying.");
+                return;
+            }
+
+            if (exactMatchCount > 1)
+            {
+                Cancel("Order placement verification failed: multiple exact matching new orders " +
+                    "appeared (ambiguous); inspect the placed-orders tab before retrying.");
+                return;
+            }
+
+            if (exactMatchCount == 1 && matched != null)
+            {
+                Outcome = matched;
                 State = OrderPlacementState.Completed;
                 _completedNotificationPending = true;
-                Status = $"Order placed: {_offeredAmount} {_step.OfferedCurrency.Name} -> " +
+                var modeLabel = _mode == ExecutionMode.RestingLimit ? "resting" : "immediate";
+                Status = $"Order placed ({modeLabel}): {_offeredAmount} {_step!.OfferedCurrency.Name} -> " +
                     $"{_wantedAmount} {_step.WantedCurrency.Name}; exchange reports " +
-                    $"order {order.PlayerOrderId} as {orderStatus}.";
+                    $"order {matched.PlayerOrderId} as {matched.Status}.";
                 return;
             }
         }
@@ -424,7 +467,7 @@ public sealed class OrderPlacementController
         if (DateTimeOffset.UtcNow >= _placementDeadlineUtc)
         {
             Cancel("Order placement verification timed out: no new order for the staged " +
-                "pair appeared within 3s; check gold and the placed-orders tab before retrying.");
+                "pair/ratio appeared within 3s; check gold and the placed-orders tab before retrying.");
         }
     }
 

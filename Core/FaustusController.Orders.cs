@@ -429,9 +429,18 @@ public sealed partial class FaustusController
             return;
         }
 
+        if (context.IsResting && !Settings.AllowCompetingOrderExecution)
+        {
+            _orderStagingController.Cancel(
+                "Order staging blocked: the selected first hop is a RESTING LIMIT order; " +
+                "enable Allow Competing Order Execution to stage it.");
+            return;
+        }
+
         _ = _orderStagingController.Start(
             GameController,
             context.Step,
+            context.Mode,
             context.Spent,
             context.Received,
             out _);
@@ -485,6 +494,9 @@ public sealed partial class FaustusController
             return false;
         }
 
+        var mode = hop.ExecutionMode == ExecutionModes.RestingLimit
+            ? ExecutionMode.RestingLimit
+            : ExecutionMode.Immediate;
         context = new HopExecutionContext(
             new CurrencyScanPlanStep(0, offered, wanted),
             hop.OfferedCurrency,
@@ -492,7 +504,9 @@ public sealed partial class FaustusController
             hop.Spent,
             hop.Received,
             hop.GiveUnitsPerLot,
-            hop.GetUnitsPerLot);
+            hop.GetUnitsPerLot,
+            mode,
+            hop.BookSide);
         failureReason = string.Empty;
         return true;
     }

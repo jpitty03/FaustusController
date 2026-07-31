@@ -13,7 +13,12 @@ public sealed record HopExecutionContext(
     long Spent,
     long Received,
     int GiveUnitsPerLot,
-    int GetUnitsPerLot);
+    int GetUnitsPerLot,
+    ExecutionMode Mode,
+    string BookSide)
+{
+    public bool IsResting => Mode == ExecutionMode.RestingLimit;
+}
 
 /// <summary>
 /// The persisted result of one multi-hop route execution (F5): the per-hop audits plus

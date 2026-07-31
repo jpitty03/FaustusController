@@ -17,6 +17,10 @@ public sealed class CurrencyRouteRequestFile
     public long GoldCostPerHop { get; set; }
     public long GoldBudget { get; set; }
     public bool RequireProfit { get; set; }
+    // Opt-in per league: when false (default) the analyzer excludes every RestingLimit
+    // (maker) edge and plans immediate-only routes. When true, resting hops may appear in
+    // routes — but live placement of a resting hop still needs AllowCompetingOrderExecution.
+    public bool AllowRestingOrders { get; set; }
 }
 
 public sealed class CurrencyRouteAnalysisFile
@@ -42,6 +46,9 @@ public sealed class CurrencyRouteAnalysisFile
     public bool UsesGoldCosts { get; set; }
     public bool CycleMode { get; set; }
     public bool RequireProfit { get; set; }
+    public bool AllowsRestingOrders { get; set; }
+    // Resting (maker) edges dropped before adjacency because AllowRestingOrders was off.
+    public int ExcludedRestingEdgeCount { get; set; }
     public string Ranking { get; set; } = "";
     public CurrencyRouteCapture? BestRoute { get; set; }
     public List<CurrencyRouteCapture> Routes { get; set; } = [];
@@ -78,6 +85,8 @@ public sealed class CurrencyRouteHopCapture
     public Guid CaptureId { get; set; }
     public DateTimeOffset CapturedAtUtc { get; set; }
     public string BookSide { get; set; } = "";
+    // Immediate (take a listing now) or RestingLimit (post a resting order). See ExecutionModes.
+    public string ExecutionMode { get; set; } = ExecutionModes.Immediate;
     public string Coherence { get; set; } = "";
     public long GoldCost { get; set; }
     public int FillableLots { get; set; }

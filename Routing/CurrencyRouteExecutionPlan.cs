@@ -10,7 +10,7 @@ public readonly record struct RouteExecutionPlanResult(
 
 public sealed class CurrencyRouteExecutionPlanExporter
 {
-    private const int CurrentSchemaVersion = 2;
+    private const int CurrentSchemaVersion = 3;
 
     public RouteExecutionPlanResult Export(
         CurrencyCatalogue catalogue,
@@ -59,6 +59,7 @@ public sealed class CurrencyRouteExecutionPlanExporter
                 AgeSecondsAtExport = (long)ageAtExport.TotalSeconds,
                 FreshAtExport = freshAtExport,
                 BookSide = hop.BookSide,
+                ExecutionMode = hop.ExecutionMode,
                 Coherence = hop.Coherence,
                 GiveUnitsPerLot = hop.GiveUnitsPerLot,
                 GetUnitsPerLot = hop.GetUnitsPerLot,
@@ -181,6 +182,7 @@ public sealed class CurrencyRouteExecutionPlanExporter
                 step.ExpectedReceived <= 0 || step.ExpectedRemainder < 0 ||
                 step.GoldCost < 0 || step.FillableLots < 0 ||
                 step.BookSide is not "ImmediateBook" and not "CompetingBook" ||
+                !ExecutionModes.IsValid(step.ExecutionMode) ||
                 step.Coherence is not "ActiveDiscoveryProbe" and
                     not "CompletedBoundedScan" ||
                 step.ExpectedSpent != (long)step.ExpectedLots * step.GiveUnitsPerLot ||
@@ -231,6 +233,8 @@ public sealed class RouteExecutionStepCapture
     public long AgeSecondsAtExport { get; set; }
     public bool FreshAtExport { get; set; }
     public string BookSide { get; set; } = "";
+    // Immediate (take a listing now) or RestingLimit (post a resting order). See ExecutionModes.
+    public string ExecutionMode { get; set; } = ExecutionModes.Immediate;
     public string Coherence { get; set; } = "";
     public int GiveUnitsPerLot { get; set; }
     public int GetUnitsPerLot { get; set; }

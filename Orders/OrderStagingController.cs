@@ -30,8 +30,11 @@ public sealed class OrderStagingController
 
     private readonly SinglePairScanController _pairController = new();
     private CurrencyScanPlanStep? _step;
+    private ExecutionMode _mode;
+    private long _plannedSpent;
     private long _offeredAmount;
     private long _wantedAmount;
+    private long _uncommittedRemainder;
     private string _league = "";
     private ExchangePairSnapshot? _stagedSnapshot;
     private DateTimeOffset _lockInDeadlineUtc;
@@ -50,9 +53,15 @@ public sealed class OrderStagingController
     public long OfferedAmount => _offeredAmount;
     public long WantedAmount => _wantedAmount;
 
-    // The top immediate market rate of the final staged capture, read by
-    // SingleHopExecutionController for its pre-execution rate gate. Null until Staged.
-    public RationalExchangeRate? StagedImmediateRate { get; private set; }
+    // The execution mode of the staged order and the planned spend that was uncommitted
+    // (resting orders only leave a remainder; immediate orders always commit the full spend).
+    public ExecutionMode StagedMode => _mode;
+    public long UncommittedRemainder => _uncommittedRemainder;
+
+    // The final staged quote — immediate mode: the top immediate market rate; resting mode:
+    // the top competing rate the order queues at. Read by SingleHopExecutionController for its
+    // pre-execution rate gate and by OrderPlacementController for verification. Null until Staged.
+    public RationalExchangeRate? StagedRate { get; private set; }
 
     // Forwarded to the inner scan controller so the host's single sample-count
     // setting reaches the staging pair scan too.
@@ -65,6 +74,7 @@ public sealed class OrderStagingController
     public bool Start(
         GameController gameController,
         CurrencyScanPlanStep step,
+        ExecutionMode mode,
         long offeredAmount,
         long wantedAmount,
         out string failureReason)
@@ -102,19 +112,30 @@ public sealed class OrderStagingController
                 out failureReason);
         }
 
+        // Narrow the pair scan to the book this mode trades against so a resting order never
+        // stabilizes on an immediate quote (and vice versa). Set after Start, which resets it.
+        _pairController.RateRequirement = mode == ExecutionMode.RestingLimit
+            ? StableRateRequirement.CompetingBook
+            : StableRateRequirement.ImmediateBook;
+
         _step = step;
+        _mode = mode;
+        _plannedSpent = offeredAmount;
         _offeredAmount = offeredAmount;
         _wantedAmount = wantedAmount;
+        _uncommittedRemainder = 0;
         _league = gameController.Game.IngameState.ServerData.League;
         _stagedSnapshot = null;
-        StagedImmediateRate = null;
+        StagedRate = null;
         _lockInKeySent = false;
         State = OrderStagingState.SelectingPair;
-        Status = $"Staging order (dry run): {step.OfferedCurrency.Name} " +
+        Status = $"Staging {ModeLabel} order (dry run): {step.OfferedCurrency.Name} " +
             $"{offeredAmount} -> {step.WantedCurrency.Name} {wantedAmount}.";
         failureReason = string.Empty;
         return true;
     }
+
+    private string ModeLabel => _mode == ExecutionMode.RestingLimit ? "resting limit" : "immediate";
 
     public void Tick(
         GameController gameController,
@@ -287,19 +308,32 @@ public sealed class OrderStagingController
             return;
         }
 
-        // Recompute the amounts to the live market rate before typing so the order
-        // captures a better rate (buys more) or adapts to a worse one; the caller's
-        // profitability gate then decides whether to actually place it.
-        if (!TryRecomputeToLiveRate(snapshot, out var recomputeFailure))
+        if (_mode == ExecutionMode.RestingLimit)
         {
-            Cancel($"Order staging blocked: {recomputeFailure}");
-            return;
+            // Resting: size to whole live competing lots (offered <= planned spend); the exact
+            // reduced competing ratio is used, leaving the remainder uncommitted. No immediate
+            // stock check — a resting order queues, it does not consume listed depth.
+            if (!TryComputeRestingAmounts(snapshot, out var restingFailure))
+            {
+                Cancel($"Order staging blocked: {restingFailure}");
+                return;
+            }
         }
-
-        if (!TryValidateImmediateStock(snapshot, out var stockFailure))
+        else
         {
-            Cancel($"Order staging blocked: {stockFailure}");
-            return;
+            // Immediate: recompute wanted to the live top immediate rate for a fixed offered
+            // amount (capture a better rate / adapt to a worse one), then require listed depth.
+            if (!TryRecomputeToLiveRate(snapshot, out var recomputeFailure))
+            {
+                Cancel($"Order staging blocked: {recomputeFailure}");
+                return;
+            }
+
+            if (!TryValidateImmediateStock(snapshot, out var stockFailure))
+            {
+                Cancel($"Order staging blocked: {stockFailure}");
+                return;
+            }
         }
 
         if (!amountController.StartAutomated(
@@ -314,7 +348,42 @@ public sealed class OrderStagingController
         }
 
         State = OrderStagingState.TypingOfferedAmount;
-        Status = $"Pair verified with a live market rate; typing offered amount {_offeredAmount}.";
+        Status = $"Pair verified with a live {ModeLabel} rate; typing offered amount {_offeredAmount}" +
+            (_uncommittedRemainder > 0 ? $" ({_uncommittedRemainder} left uncommitted)." : ".");
+    }
+
+    // Sizes a resting order to the largest whole number of live competing lots whose offered
+    // amount does not exceed the planned spend, using the exact reduced competing ratio. The
+    // wanted amount is lots*get; the leftover planned spend is left uncommitted.
+    private bool TryComputeRestingAmounts(
+        ExchangePairSnapshot snapshot,
+        out string failureReason)
+    {
+        var rate = snapshot.TopCompetingStock?.SelectedPairRate;
+        if (rate == null)
+        {
+            failureReason = "no live competing quote is available to post a resting order at.";
+            return false;
+        }
+
+        if (!OrderExecutionMath.TryComputeRestingLots(
+            _plannedSpent,
+            rate.GetUnits,
+            rate.GiveUnits,
+            out _,
+            out var offered,
+            out var wanted,
+            out var remainder,
+            out failureReason))
+        {
+            return false;
+        }
+
+        _offeredAmount = offered;
+        _wantedAmount = wanted;
+        _uncommittedRemainder = remainder;
+        failureReason = string.Empty;
+        return true;
     }
 
     private bool VerifyPairStillSelected(
@@ -526,17 +595,51 @@ public sealed class OrderStagingController
         }
 
         _stagedSnapshot = finalSnapshot;
-        if (!TryValidateImmediateStock(finalSnapshot!, out var finalStockFailure))
+        if (_mode == ExecutionMode.RestingLimit)
         {
-            Cancel($"Order staging stopped: the order is no longer available — {finalStockFailure}");
-            return;
+            // Favorable competing-head drift only: the typed order must stay at least as
+            // competitive as the final competing head. A missing head or an adverse move
+            // (the head now offers less) aborts before Place Order becomes the caller's.
+            var finalCompeting = finalSnapshot!.TopCompetingStock?.SelectedPairRate;
+            if (finalCompeting == null)
+            {
+                Cancel("Order staging stopped: the competing quote vanished before lock-in.");
+                return;
+            }
+
+            if (!OrderExecutionMath.IsAtLeastAsCompetitiveAsHead(
+                _offeredAmount,
+                _wantedAmount,
+                finalCompeting.GetUnits,
+                finalCompeting.GiveUnits))
+            {
+                Cancel("Order staging stopped: the competing head moved against the typed " +
+                    $"resting order ({_wantedAmount}:{_offeredAmount} vs head " +
+                    $"{finalCompeting.GetUnits}:{finalCompeting.GiveUnits}); no order left resting.");
+                return;
+            }
+
+            StagedRate = finalCompeting;
+        }
+        else
+        {
+            if (!TryValidateImmediateStock(finalSnapshot!, out var finalStockFailure))
+            {
+                Cancel($"Order staging stopped: the order is no longer available — {finalStockFailure}");
+                return;
+            }
+
+            StagedRate = finalSnapshot!.TopImmediateRate;
         }
 
-        StagedImmediateRate = finalSnapshot!.TopImmediateRate;
         State = OrderStagingState.Staged;
-        Status = $"DRY RUN staged: {_step!.OfferedCurrency.Name} {_offeredAmount} -> " +
-            $"{_step.WantedCurrency.Name} {_wantedAmount}; amounts locked in, the " +
-            "immediate fill is still listed, and Place Order is yours to click" +
+        Status = $"DRY RUN staged ({ModeLabel}): {_step!.OfferedCurrency.Name} {_offeredAmount} -> " +
+            $"{_step.WantedCurrency.Name} {_wantedAmount}" +
+            (_uncommittedRemainder > 0 ? $" ({_uncommittedRemainder} uncommitted)" : "") +
+            "; amounts locked in and Place Order is yours to click" +
+            (_mode == ExecutionMode.RestingLimit
+                ? " (resting — it will queue, not fill on click)"
+                : ", the immediate fill is still listed") +
             (stillActive ? " (an input flag stayed latched in memory)." : ".");
     }
 

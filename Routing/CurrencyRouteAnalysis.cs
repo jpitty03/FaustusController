@@ -14,13 +14,15 @@ public readonly record struct CurrencyRouteAnalysisResult(
     bool UsesLiquidityLimits,
     bool UsesGoldCosts,
     bool CycleMode,
-    long? BestNetGainUnits);
+    long? BestNetGainUnits,
+    bool AllowsRestingOrders,
+    int ExcludedRestingEdgeCount);
 
 public sealed class CurrencyRouteAnalyzer
 {
-    private const int CurrentRequestSchemaVersion = 3;
-    private const int CurrentAnalysisSchemaVersion = 3;
-    private const int SupportedGraphSchemaVersion = 1;
+    private const int CurrentRequestSchemaVersion = 4;
+    private const int CurrentAnalysisSchemaVersion = 4;
+    private const int SupportedGraphSchemaVersion = 2;
 
     public CurrencyRouteRequestFile LoadOrCreateRequest(
         CurrencyCatalogue catalogue,
@@ -54,10 +56,11 @@ public sealed class CurrencyRouteAnalyzer
             File.ReadAllText(requestPath)) ??
             throw new InvalidDataException("The route request file is empty.");
 
-        if (loaded.SchemaVersion is 1 or 2)
+        if (loaded.SchemaVersion is 1 or 2 or 3)
         {
-            // v1->v2 added gold/liquidity fields; v2->v3 added RequireProfit.
-            // Pre-existing files default RequireProfit off, preserving acyclic behavior.
+            // v1->v2 added gold/liquidity fields; v2->v3 added RequireProfit; v3->v4 added
+            // AllowRestingOrders. Pre-existing files default RequireProfit and
+            // AllowRestingOrders off, preserving immediate-only behavior.
             loaded.SchemaVersion = CurrentRequestSchemaVersion;
             WriteAtomically(requestPath, loaded);
         }
@@ -98,9 +101,19 @@ public sealed class CurrencyRouteAnalyzer
         var maximumAge = TimeSpan.FromMinutes(graph.MaximumQuoteAgeMinutes);
         var freshEdges = new List<CurrencyConversionGraphEdgeCapture>();
         var expiredEdgeCount = 0;
+        var excludedRestingEdgeCount = 0;
         foreach (var edge in graph.Edges)
         {
             ValidateEdge(edge, vertices);
+            // Maker/resting edges are opt-in per league. When off, drop them before
+            // adjacency so routes stay immediate-only; report how many were excluded.
+            if (!request.AllowRestingOrders &&
+                edge.ExecutionMode == ExecutionModes.RestingLimit)
+            {
+                excludedRestingEdgeCount++;
+                continue;
+            }
+
             if (edge.CapturedAtUtc > analyzedAtUtc ||
                 analyzedAtUtc - edge.CapturedAtUtc > maximumAge)
             {
@@ -111,8 +124,10 @@ public sealed class CurrencyRouteAnalyzer
             freshEdges.Add(edge);
         }
 
+        // Identity is directed pair plus execution mode, so an Immediate and a RestingLimit
+        // edge for the same pair coexist as separate adjacency entries (deterministic order).
         var adjacency = freshEdges
-            .GroupBy(edge => new { edge.OfferedMetadata, edge.WantedMetadata, edge.BookSide })
+            .GroupBy(edge => new { edge.OfferedMetadata, edge.WantedMetadata, edge.ExecutionMode })
             .Select(group => group
                 .OrderByDescending(edge => edge.CapturedAtUtc)
                 .ThenByDescending(edge => edge.CaptureId)
@@ -122,7 +137,7 @@ public sealed class CurrencyRouteAnalyzer
                 group => group.Key,
                 group => group
                     .OrderBy(edge => edge.WantedMetadata, StringComparer.Ordinal)
-                    .ThenBy(edge => edge.BookSide, StringComparer.Ordinal)
+                    .ThenBy(edge => edge.ExecutionMode, StringComparer.Ordinal)
                     .ToArray(),
                 StringComparer.Ordinal);
         var cycleMode = string.Equals(
@@ -197,6 +212,8 @@ public sealed class CurrencyRouteAnalyzer
             UsesGoldCosts = request.GoldCostPerHop > 0 || request.GoldBudget > 0,
             CycleMode = cycleMode,
             RequireProfit = request.RequireProfit,
+            AllowsRestingOrders = request.AllowRestingOrders,
+            ExcludedRestingEdgeCount = excludedRestingEdgeCount,
             Ranking = cycleMode
                 ? "Maximum net start-currency gain, then lower total gold cost, " +
                     "fewer stranded remainder currencies, fewer hops, deterministic path"
@@ -222,7 +239,9 @@ public sealed class CurrencyRouteAnalyzer
             analysis.UsesLiquidityLimits,
             analysis.UsesGoldCosts,
             cycleMode,
-            cycleMode ? analysis.BestRoute?.NetGainUnits : null);
+            cycleMode ? analysis.BestRoute?.NetGainUnits : null,
+            analysis.AllowsRestingOrders,
+            analysis.ExcludedRestingEdgeCount);
     }
 
     private static void Search(
@@ -287,7 +306,11 @@ public sealed class CurrencyRouteAnalyzer
             var fillableLots = 0;
             var lotsCappedByLiquidity = false;
             var lots = unconstrainedLots;
-            if (constraints.UseLiquidityLimits && edge.ListedCount > 0)
+            // Liquidity limits apply only to Immediate edges: a resting order's competing
+            // listed volume is queue competition, not fill depth, so it is never capped.
+            var liquidityApplies = constraints.UseLiquidityLimits &&
+                edge.HasImmediateLiquidity && edge.ListedCount > 0;
+            if (liquidityApplies)
             {
                 fillableLots = edge.ListedCount;
                 if (lots > fillableLots)
@@ -299,8 +322,7 @@ public sealed class CurrencyRouteAnalyzer
 
             if (lots <= 0)
             {
-                if (constraints.UseLiquidityLimits && edge.ListedCount > 0 &&
-                    unconstrainedLots > 0)
+                if (liquidityApplies && unconstrainedLots > 0)
                 {
                     search.RejectedLiquidityLimitCount++;
                 }
@@ -394,8 +416,11 @@ public sealed class CurrencyRouteAnalyzer
                         nextTotalGold,
                         nextHops,
                         nextRemainders,
+                        // Path identity includes execution mode so the immediate and resting
+                        // variants of a directed pair rank as distinct routes.
                         string.Join(">", nextHops.Select(hop =>
-                            $"{hop.Edge.OfferedMetadata}:{hop.Edge.WantedMetadata}"))));
+                            $"{hop.Edge.OfferedMetadata}:{hop.Edge.WantedMetadata}:" +
+                            $"{hop.Edge.ExecutionMode}"))));
                     TrimRoutes(routes, maximumResults);
                 }
 
@@ -489,6 +514,7 @@ public sealed class CurrencyRouteAnalyzer
                 CaptureId = hop.Edge.CaptureId,
                 CapturedAtUtc = hop.Edge.CapturedAtUtc,
                 BookSide = hop.Edge.BookSide,
+                ExecutionMode = hop.Edge.ExecutionMode,
                 Coherence = hop.Edge.Coherence,
                 GoldCost = hop.GoldCost,
                 FillableLots = hop.FillableLots,
@@ -570,7 +596,8 @@ public sealed class CurrencyRouteAnalyzer
             edge.ListedCount < 0 ||
             !RationalExchangeRate.TryCreate(edge.RawGet, edge.RawGive, out var rate) ||
             rate!.GetUnits != edge.GetUnits || rate.GiveUnits != edge.GiveUnits ||
-            edge.BookSide is not "ImmediateBook" and not "CompetingBook")
+            edge.BookSide is not "ImmediateBook" and not "CompetingBook" ||
+            !ExecutionModes.IsValid(edge.ExecutionMode))
         {
             throw new InvalidDataException("Conversion graph contains an invalid route edge.");
         }
