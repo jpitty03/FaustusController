@@ -31,6 +31,9 @@ public sealed class SingleHopExecutionController
     private long _plannedReceived;
     private int _plannedGiveUnits;
     private int _plannedGetUnits;
+    private double _minWantedPerOffered;
+    private long _recomputedSpent;
+    private long _recomputedReceived;
     private int _executedGiveUnits;
     private int _executedGetUnits;
     private bool _ratePreCheckPassed;
@@ -53,6 +56,7 @@ public sealed class SingleHopExecutionController
         long plannedReceived,
         int plannedGiveUnitsPerLot,
         int plannedGetUnitsPerLot,
+        double minWantedPerOffered,
         out string failureReason)
     {
         if (IsRunning)
@@ -86,6 +90,9 @@ public sealed class SingleHopExecutionController
         _plannedReceived = plannedReceived;
         _plannedGiveUnits = plannedGiveUnitsPerLot;
         _plannedGetUnits = plannedGetUnitsPerLot;
+        _minWantedPerOffered = minWantedPerOffered;
+        _recomputedSpent = plannedSpent;
+        _recomputedReceived = plannedReceived;
         _executedGiveUnits = 0;
         _executedGetUnits = 0;
         _ratePreCheckPassed = false;
@@ -149,29 +156,32 @@ public sealed class SingleHopExecutionController
             return;
         }
 
-        // Pre-execution rate gate: the live staged rate must give at least as many
-        // wanted units per offered unit as the plan, otherwise the market moved
-        // against us and the trade could break the route's economics — never click.
+        // Staging has recomputed the amounts to the live rate; the profitability gate
+        // decides whether to place. The live staged rate must give at least the caller's
+        // floor of wanted units per offered unit (F10: the hop's planned rate; F5: the
+        // rate that keeps the whole loop net-positive) — otherwise never click.
         var live = stagingController.StagedImmediateRate;
         if (live == null)
         {
             stagingController.Cancel(
                 "Single-hop execution aborted: the staged pair has no live immediate rate.");
-            Cancel("Single-hop execution aborted: no live immediate rate to verify against the plan.");
+            Cancel("Single-hop execution aborted: no live immediate rate to verify against the floor.");
             return;
         }
 
         _executedGiveUnits = live.GiveUnits;
         _executedGetUnits = live.GetUnits;
-        _ratePreCheckPassed =
-            (long)live.GetUnits * _plannedGiveUnits >= (long)_plannedGetUnits * live.GiveUnits;
+        _recomputedSpent = stagingController.OfferedAmount;
+        _recomputedReceived = stagingController.WantedAmount;
+        _ratePreCheckPassed = live.GetUnits >= _minWantedPerOffered * live.GiveUnits;
         if (!_ratePreCheckPassed)
         {
             stagingController.Cancel(
-                "Single-hop execution aborted: the live rate moved against the plan.");
+                "Single-hop execution aborted: the live rate is below the profitability floor.");
             Cancel(
-                $"Single-hop execution aborted: live rate {live.GetUnits}:{live.GiveUnits} is worse " +
-                $"than planned {_plannedGetUnits}:{_plannedGiveUnits}; no order placed.");
+                $"Single-hop execution aborted: live rate {live.GetUnits}:{live.GiveUnits} " +
+                $"({(double)live.GetUnits / live.GiveUnits:F4} wanted/offered) is below the floor " +
+                $"{_minWantedPerOffered:F4}; no order placed.");
             return;
         }
 
@@ -210,8 +220,9 @@ public sealed class SingleHopExecutionController
 
         _pendingAudit = BuildAudit(outcome);
         State = SingleHopExecutionState.Completed;
-        Status = $"Executed {_plannedSpent} {_offeredCurrency.Name} -> {_pendingAudit.ActualReceived} " +
-            $"{_wantedCurrency.Name} (planned {_plannedReceived}; " +
+        Status = $"Executed {_recomputedSpent} {_offeredCurrency.Name} -> " +
+            $"{_pendingAudit.ActualReceived} {_wantedCurrency.Name} " +
+            $"(planned {_plannedReceived}, recomputed {_recomputedReceived}; " +
             (_pendingAudit.FullyFilled
                 ? "fully filled"
                 : $"shortfall {_pendingAudit.ReceivedShortfall}") +
@@ -226,7 +237,9 @@ public sealed class SingleHopExecutionController
         var actualReceived = outcome.OfferedRatioPart > 0
             ? (long)offeredSpent * outcome.WantedRatioPart / outcome.OfferedRatioPart
             : 0;
-        var shortfall = _plannedReceived - actualReceived;
+        // Shortfall is measured against what we actually asked for at the live rate
+        // (the recomputed amount), not the stale analysis plan.
+        var shortfall = _recomputedReceived - actualReceived;
         return new HopExecutionAuditFile
         {
             SchemaVersion = 1,
@@ -238,6 +251,8 @@ public sealed class SingleHopExecutionController
             PlannedGetUnitsPerLot = _plannedGetUnits,
             PlannedSpent = _plannedSpent,
             PlannedReceived = _plannedReceived,
+            RecomputedSpent = _recomputedSpent,
+            RecomputedReceived = _recomputedReceived,
             ExecutedGiveUnits = _executedGiveUnits,
             ExecutedGetUnits = _executedGetUnits,
             RatePreCheckPassed = _ratePreCheckPassed,

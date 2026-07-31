@@ -135,13 +135,21 @@ public sealed class CurrencyRouteAnalyzer
         {
             request.StartCurrency.Metadata
         };
-        var constraints = new RouteConstraints(
-            request.InventoryBalances
+        // A profit loop must flow only what each hop produces (telescoping), starting
+        // from StartAmount — folding owned inventory into a hop's spendable amount would
+        // let it "buy a little, then dump the stockpile" and report that liquidation as
+        // loop profit. So cycle mode ignores inventory; acyclic Start->Target analysis
+        // keeps using it (spending owned currency to convert it is legitimate there).
+        var inventoryBalances = cycleMode
+            ? new Dictionary<string, long>(StringComparer.Ordinal)
+            : request.InventoryBalances
                 .Where(balance => balance.Units > 0)
                 .ToDictionary(
                     balance => balance.Metadata,
                     balance => balance.Units,
-                    StringComparer.Ordinal),
+                    StringComparer.Ordinal);
+        var constraints = new RouteConstraints(
+            inventoryBalances,
             request.UseLiquidityLimits,
             request.GoldCostPerHop,
             request.GoldBudget);
@@ -184,7 +192,7 @@ public sealed class CurrencyRouteAnalyzer
             RejectedLiquidityLimitCount = search.RejectedLiquidityLimitCount,
             RejectedGoldBudgetCount = search.RejectedGoldBudgetCount,
             SearchTruncated = search.Truncated,
-            UsesInventoryBalances = request.InventoryBalances.Count > 0,
+            UsesInventoryBalances = !cycleMode && request.InventoryBalances.Count > 0,
             UsesLiquidityLimits = request.UseLiquidityLimits,
             UsesGoldCosts = request.GoldCostPerHop > 0 || request.GoldBudget > 0,
             CycleMode = cycleMode,

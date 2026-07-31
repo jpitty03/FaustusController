@@ -110,4 +110,17 @@ public sealed class FaustusControllerSettings : ISettings
     {
         IgnoreFocusedInput = true
     };
+    // Verified multi-hop route execution: chains the selected route's hops
+    // (execute -> wait for fill -> collect -> next). The most autonomous action;
+    // requires every single-hop-execution and order-collection permission too.
+    public ToggleNode AllowMultiHopExecution { get; set; } = new(false);
+    public HotkeyNodeV2 MultiHopExecuteKey { get; set; } = new(Keys.F5)
+    {
+        IgnoreFocusedInput = true
+    };
+    // How far (%) the live market rate may fall below a hop's analysis-planned rate
+    // and still execute. 0 = only trade when the live rate is at least as good as
+    // planned (a better rate always recomputes up and proceeds); raise it to tolerate
+    // small adverse drift. Applies to F10 and every F5 hop.
+    public RangeNode<int> MaxRateSlippagePercent { get; set; } = new(0, 0, 100);
 }

@@ -287,6 +287,15 @@ public sealed class OrderStagingController
             return;
         }
 
+        // Recompute the amounts to the live market rate before typing so the order
+        // captures a better rate (buys more) or adapts to a worse one; the caller's
+        // profitability gate then decides whether to actually place it.
+        if (!TryRecomputeToLiveRate(snapshot, out var recomputeFailure))
+        {
+            Cancel($"Order staging blocked: {recomputeFailure}");
+            return;
+        }
+
         if (!TryValidateImmediateStock(snapshot, out var stockFailure))
         {
             Cancel($"Order staging blocked: {stockFailure}");
@@ -344,6 +353,46 @@ public sealed class OrderStagingController
         var snapshot = _stagedSnapshot;
         _stagedSnapshot = null;
         return snapshot;
+    }
+
+    // Re-prices the staged wanted amount to the live top immediate rate for the given
+    // offered amount: wanted = floor(offered * getUnits / giveUnits). A better live rate
+    // yields a larger wanted (buy more); a worse one a smaller one. No whole-lot
+    // requirement — you need not offer a full giveUnits lot to buy some wanted. Liquidity
+    // is validated separately by TryValidateImmediateStock. Leaves the amounts unchanged
+    // when no live immediate rate is present.
+    private bool TryRecomputeToLiveRate(
+        ExchangePairSnapshot snapshot,
+        out string failureReason)
+    {
+        var rate = snapshot.TopImmediateStock?.SelectedPairRate;
+        if (rate == null)
+        {
+            failureReason = string.Empty;
+            return true;
+        }
+
+        long recomputedWanted;
+        try
+        {
+            recomputedWanted = checked(_offeredAmount * rate.GetUnits) / rate.GiveUnits;
+        }
+        catch (OverflowException)
+        {
+            failureReason = "recomputing the trade to the live rate overflowed.";
+            return false;
+        }
+
+        if (recomputedWanted <= 0)
+        {
+            failureReason = $"the offered {_offeredAmount} is too small to buy even one unit " +
+                $"at the live top rate ({rate.GetUnits}:{rate.GiveUnits}).";
+            return false;
+        }
+
+        _wantedAmount = recomputedWanted;
+        failureReason = string.Empty;
+        return true;
     }
 
     private bool TryValidateImmediateStock(

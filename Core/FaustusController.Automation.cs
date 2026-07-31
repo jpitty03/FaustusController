@@ -205,7 +205,8 @@ public sealed partial class FaustusController
         _orderStagingController.IsRunning ||
         _orderPlacementController.IsRunning ||
         _singleHopExecutionController.IsRunning ||
-        _orderCollectionController.IsRunning;
+        _orderCollectionController.IsRunning ||
+        _multiHopController.IsRunning;
 
     private void CancelSinglePairAutomation(string reason)
     {

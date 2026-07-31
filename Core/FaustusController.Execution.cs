@@ -52,22 +52,28 @@ public sealed partial class FaustusController
             return;
         }
 
-        if (!TryBuildSelectedFirstHopStep(out var hop, out var step, out var failure))
+        if (!TryBuildHopContext(0, out var context, out var failure))
         {
             _hopExecutionStatus = $"Single-hop execution blocked: {failure}";
             return;
         }
 
+        // A standalone hop's floor is its own planned rate less the allowed slippage:
+        // don't trade worse than the analysis assumed (a better live rate still
+        // recomputes up and proceeds).
+        var plannedRate = (double)context.Received / context.Spent *
+            (1.0 - Settings.MaxRateSlippagePercent.Value / 100.0);
         if (!_singleHopExecutionController.Start(
             GameController,
             _orderStagingController,
-            step,
-            hop.OfferedCurrency,
-            hop.WantedCurrency,
-            hop.Spent,
-            hop.Received,
-            hop.GiveUnitsPerLot,
-            hop.GetUnitsPerLot,
+            context.Step,
+            context.OfferedCurrency,
+            context.WantedCurrency,
+            context.Spent,
+            context.Received,
+            context.GiveUnitsPerLot,
+            context.GetUnitsPerLot,
+            plannedRate,
             out var startFailure))
         {
             _hopExecutionStatus = startFailure;

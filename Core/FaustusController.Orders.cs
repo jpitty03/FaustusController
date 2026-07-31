@@ -423,7 +423,7 @@ public sealed partial class FaustusController
             return;
         }
 
-        if (!TryBuildSelectedFirstHopStep(out var hop, out var step, out var failure))
+        if (!TryBuildHopContext(0, out var context, out var failure))
         {
             _orderStagingController.Cancel($"Order staging blocked: {failure}");
             return;
@@ -431,22 +431,22 @@ public sealed partial class FaustusController
 
         _ = _orderStagingController.Start(
             GameController,
-            step,
-            hop.Spent,
-            hop.Received,
+            context.Step,
+            context.Spent,
+            context.Received,
             out _);
     }
 
-    // Resolves the currently-selected analysis route's first hop into a scan-plan
-    // step, shared by the F6 staging dry run and F10 single-hop execution. Failure
+    // Resolves hop <paramref name="hopIndex"/> of the currently-selected analysis route
+    // into a full execution context (pair step + planned economics), shared by the F6
+    // staging dry run, F10 single-hop execution, and F5 multi-hop chaining. Failure
     // reasons are neutral so each caller can prefix them with its own context.
-    private bool TryBuildSelectedFirstHopStep(
-        out CurrencyRouteHopCapture hop,
-        out CurrencyScanPlanStep step,
+    private bool TryBuildHopContext(
+        int hopIndex,
+        out HopExecutionContext context,
         out string failureReason)
     {
-        hop = null!;
-        step = null!;
+        context = null!;
         if (_catalogue == null)
         {
             failureReason = "the currency catalogue is not ready.";
@@ -462,29 +462,37 @@ public sealed partial class FaustusController
 
         var routeIndex = Math.Clamp(_routeDisplayIndex, 0, analysis.Routes.Count - 1);
         var route = analysis.Routes[routeIndex];
-        if (route.Hops.Count == 0)
+        if (hopIndex < 0 || hopIndex >= route.Hops.Count)
         {
-            failureReason = "the selected route has no hops.";
+            failureReason = route.Hops.Count == 0
+                ? "the selected route has no hops."
+                : $"hop index {hopIndex + 1} is out of range for the selected route.";
             return false;
         }
 
-        var first = route.Hops[0];
-        if (!_catalogue.TryGetByMetadata(first.OfferedCurrency.Metadata, out var offered) ||
+        var hop = route.Hops[hopIndex];
+        if (!_catalogue.TryGetByMetadata(hop.OfferedCurrency.Metadata, out var offered) ||
             offered == null)
         {
-            failureReason = $"'{first.OfferedCurrency.Name}' is not in the catalogue.";
+            failureReason = $"'{hop.OfferedCurrency.Name}' is not in the catalogue.";
             return false;
         }
 
-        if (!_catalogue.TryGetByMetadata(first.WantedCurrency.Metadata, out var wanted) ||
+        if (!_catalogue.TryGetByMetadata(hop.WantedCurrency.Metadata, out var wanted) ||
             wanted == null)
         {
-            failureReason = $"'{first.WantedCurrency.Name}' is not in the catalogue.";
+            failureReason = $"'{hop.WantedCurrency.Name}' is not in the catalogue.";
             return false;
         }
 
-        hop = first;
-        step = new CurrencyScanPlanStep(0, offered, wanted);
+        context = new HopExecutionContext(
+            new CurrencyScanPlanStep(0, offered, wanted),
+            hop.OfferedCurrency,
+            hop.WantedCurrency,
+            hop.Spent,
+            hop.Received,
+            hop.GiveUnitsPerLot,
+            hop.GetUnitsPerLot);
         failureReason = string.Empty;
         return true;
     }

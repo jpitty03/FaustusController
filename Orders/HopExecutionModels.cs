@@ -37,6 +37,11 @@ public sealed class HopExecutionAuditFile
     public long PlannedSpent { get; set; }
     public long PlannedReceived { get; set; }
 
+    // Amounts recomputed to the live market rate at staging time (what we actually
+    // asked for); the executed give/get units below are that live rate.
+    public long RecomputedSpent { get; set; }
+    public long RecomputedReceived { get; set; }
+
     // The top immediate market rate at the moment of execution (from the final
     // staged capture), and whether it passed the pre-execution rate gate.
     public int ExecutedGiveUnits { get; set; }

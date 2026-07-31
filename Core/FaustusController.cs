@@ -19,6 +19,7 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
     private readonly OrderPlacementController _orderPlacementController = new();
     private readonly SingleHopExecutionController _singleHopExecutionController = new();
     private readonly OrderCollectionController _orderCollectionController = new();
+    private readonly MultiHopExecutionController _multiHopController = new();
     private readonly PickerButtonCalibrationController _pickerButtonCalibration = new();
     private readonly PickerButtonCalibrationStore _pickerButtonCalibrationStore = new();
     private readonly CalibratedPickerOpenController _pickerOpenController = new();
@@ -219,6 +220,7 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
         _singleHopExecutionController.Cancel(
             "Single-hop execution cancelled after area change.");
         _orderCollectionController.Cancel("Order collection cancelled after area change.");
+        _multiHopController.Cancel("Multi-hop execution cancelled after area change.");
         _marketDiscoveryDirty = true;
         _nextMarketDiscoveryRetryUtc = DateTimeOffset.UtcNow;
         _conversionGraphDirty = true;
@@ -315,6 +317,11 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
         if (Settings.CollectOrdersKey.PressedOnce())
         {
             StartOrderCollection();
+        }
+
+        if (Settings.MultiHopExecuteKey.PressedOnce())
+        {
+            StartMultiHopExecution();
         }
 
         if (_orderStagingController.IsRunning && !AreOrderStagingPermissionsEnabled())
@@ -526,9 +533,18 @@ public sealed partial class FaustusController : BaseSettingsPlugin<FaustusContro
         }
 
         // Ticked after placement so a Completed order and its outcome are visible
-        // this frame; drains the finished execution's audit for persistence.
-        TickSingleHopExecution();
-        TickOrderCollection();
+        // this frame. While a multi-hop chain runs it owns the executor and collection
+        // ticks (so it consumes each hop's audit); the host only ticks them standalone.
+        if (_multiHopController.IsRunning)
+        {
+            TickMultiHopExecution();
+        }
+        else
+        {
+            TickSingleHopExecution();
+            TickOrderCollection();
+            TickMultiHopExecution();
+        }
 
         var pendingProbe = _liquidityDiscoveryController.PendingProbe;
         if (pendingProbe != null && TryPersistDiscoveryProbe(pendingProbe))
